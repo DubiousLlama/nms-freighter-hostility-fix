@@ -83,6 +83,29 @@ First validation, once: warp into a system with a freighter, note the BURST line
 then land on the capital freighter and compare the class the captain quotes. If they match, the
 class is fixed at spawn and the peek is trustworthy.
 
+Finding (2026-09-11, first live run): the freighter's inventory is NOT generated at warp-in, at
+hangar entry, or when talking to the captain. It appears the instant the freighter is scanned with
+the analysis visor. The inventory (and with it the store's class field) is materialised lazily on
+first request, and the visor is the first thing that requests it. Stores created during a scan are
+tagged `visor-scan`.
+
+Step 2, turning that into a hook on the generator itself (no disassembler needed):
+
+1. Set `USE_GET_CALLER = True`, reload, land in a freighter hangar, scan the freighter with the
+   visor. The `visor-scan` lines now carry `caller NMS+0x...`, the return address inside the code
+   that filled the store.
+2. Type that number into "Caller address to resolve" and press "Find function start". The mod walks
+   back through the 0xCC padding MSVC leaves between functions and prints the nearest 16-aligned
+   function start.
+3. Put it into `GENERATOR_FUNCTION_OFFSET`, reload, scan again. You should see
+   `generator(this=0x..., seed*=0x..., arg=N, flag=...)` lines: `this` is the freighter's
+   `cGcAISpaceshipComponent`. If the line does not appear, or the arguments look wrong, the caller was
+   inside a helper rather than the generator; try the next candidate.
+
+With the generator hooked, the remaining piece for a true peek-from-space is triggering that same
+generator for the freighter before you land. That needs the freighter's component pointer at spawn
+time, which is not yet reachable from data NMS.py exposes; see the research notes.
+
 Calibration, once:
 
 1. Leave "Log every caller address" on. Warp into a system where a freighter battle triggers.
