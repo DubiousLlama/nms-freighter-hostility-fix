@@ -127,8 +127,37 @@ data edits alone. It would need a code-level hook (an ASI/DLL plugin patching th
 component), which is outside the scope of an MXML mod. Variant B (fast alert decay) is the
 closest data-only approximation.
 
+## Cargo pods: where the destruction penalties live
+
+* Entity files: `MODELS/COMMON/SPACECRAFT/INDUSTRIAL/CONTAINER/CONTAINER{A,B,C,E,F,G,H}/ENTITIES/CONTAINER_{A..H}.ENTITY.MBIN`
+  (from the pak hash list; Lenni's `NoStandingLoss.lua` in the community script collection edits
+  `StandingChangeOnDeath` in precisely these files plus the small/tiny freighter entities).
+* `cGcDestructableComponentData` on them carries `StandingChangeOnDeath[]`, `IncreaseWanted`,
+  `NoConsequencesDuringPirateBattle`, `LootReward`/`LootItems`, `DamagesParentWhenDestroyed`.
+* `cGcShootableComponentData` carries `Health`, `IncreaseWanted`, `IncreaseWantedThresholdTime`,
+  `IgnorePlayer`, `CouldCountAsArmourForParent`.
+* Player reports agree that shooting pods summons sentinels and, per the wiki, costs standing
+  with the system's race. None of that goes through the freighter's alert counter, so variant A
+  leaves those penalties intact. Whether pods ship with `NoConsequencesDuringPirateBattle` set is
+  unknown; the AMUMSS script forces it to `false`.
+
+## Why a "destruction only" freighter reaction is not available in data
+
+The freighter's reaction is a single alert accumulator in `GcAISpaceshipGlobals` fed by registered
+hits (`MinAggroDamage` filter, `FreighterRegisterHitCooldown` rate limit, two thresholds, timed
+decay). Nothing in the globals or the component data names a "destroyed a child part" input to
+it. The one speculative route is `DamagesParentWhenDestroyed` on the pod entity combined with a
+`MinAggroDamage` set above any single weapon hit but below the parent-damage event, which would
+make only the destruction event register. It is untested and depends on the parent-damage event
+going through the same registration path; it is listed here as a follow-up experiment only.
+
+Practical consequence: the only data-driven separation between "stray" and "deliberate" is
+intensity, which is what variants E and F exploit (`tools/make_variant.py`). F scales both
+thresholds; E scales decay. Both are relative to vanilla values that are not published.
+
 ## Unknowns to settle in-game (test plan)
 
+0. Variant A has been confirmed working in-game by the author (hangar stays open after stray hits).
 1. Install variant A. Start a capital-freighter defence, deliberately graze the freighter's
    pods/turrets a few times without destroying anything, finish the pirates. Expected: hangar
    open, reward hail. If still closed: variant A's field is not the gate; try B, then D.

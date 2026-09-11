@@ -54,6 +54,24 @@ SANITY = {
 }
 
 
+def load_fields(path):
+    """Return {field_name: value} for a known GLOBALS .MBIN, or raise SystemExit."""
+    data = open(path, "rb").read()
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic != MBIN_MAGIC:
+        sys.exit(f"{path}: not an MBIN (magic 0x{magic:08X})")
+    name = path.replace("\\", "/").split("/")[-1].upper()
+    key = next((k for k in FIELDS if name.startswith(k)), None)
+    if key is None:
+        sys.exit(f"{path}: no field table for this file (known: {', '.join(FIELDS)})")
+    out = {}
+    for fname, off, fmt in FIELDS[key]:
+        abs_off = HEADER_SIZE + off
+        if abs_off + struct.calcsize(fmt) <= len(data):
+            out[fname] = struct.unpack_from(fmt, data, abs_off)[0]
+    return out
+
+
 def read(path):
     data = open(path, "rb").read()
     magic = struct.unpack_from("<I", data, 0)[0]

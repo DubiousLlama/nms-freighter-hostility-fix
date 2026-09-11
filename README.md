@@ -32,10 +32,13 @@ To uninstall, delete the folder.
 
 | Folder | What it changes | When to use it |
 |---|---|---|
-| `GAMEDATA/MODS/FreighterFriendlyFireTolerance` (**A**, default) | `FreighterAttackAlertThreshold` → 1e9 | First thing to try. Hits can never escalate to hostility. |
+| `GAMEDATA/MODS/FreighterFriendlyFireTolerance` (**A**) | `FreighterAttackAlertThreshold` → 1e9 | Confirmed working in-game. Hits can never escalate to hostility. **Personal use only**: it also removes the freighter's retaliation against deliberate attacks (see "Publishing"). |
 | `variants/B-AutoForgive` | `FreighterAlertTimeOutMinTime` → 3 s, `FreighterAlertTimeOutRate` → 1e6 | Keeps hostility for a sustained deliberate attack, but the freighter forgives you a few seconds after the last hit, so the hangar is open by the time the captain hails you. Closest data-only version of "clear hostility at the reward call". Can be installed alongside A. |
 | `variants/C-IgnoreBattleFriendlyFire` | `FreighterBattleIgnoreFriendlyFireDistance` → 1e6 (in `GCSPACESHIPGLOBALS`) | Low expectations. Research (see docs/RESEARCH.md) indicates this is the radius inside which your hits on the *escort trader ships* are excused as crimes during a battle, not a freighter-hostility knob. Kept as a cheap experiment. |
 | `variants/D-IgnorePlayer` | `FreighterIgnorePlayer` → true | Sledgehammer: freighter AI ignores the player completely, including deliberate pod farming. Only if A and B both fail. |
+| **F, strict** (generate with `tools/make_variant.py --mode strict`, or `VARIANT = "F"` in the AMUMSS script) | both alert thresholds × 5, nothing else | **Recommended for publishing.** Vanilla behaviour in every respect except that the stray-hit budget per battle is five times larger. A deliberate attack on a cargo pod still crosses the threshold within seconds and the freighter stays hostile exactly as in vanilla. |
+| **E, forgive** (`--mode forgive` / `VARIANT = "E"`) | vanilla thresholds; alert bar drains in ~15 s, starting 2 s after the last hit | Sparse hits never accumulate; continuous fire trips hostility within a second or two; the freighter forgives you ~15 s after you stop. Closest to "forgive unless you benefited", but an attacker can dock again shortly after a raid. |
+| **EF** (`--mode both` / `VARIANT = "EF"`) | F thresholds and E decay | Most lenient of the deterrent-keeping options. |
 
 Install a variant exactly like A: copy the folder under `GAMEDATA/MODS/` inside the variant
 directory into the game's `GAMEDATA\MODS\`. Variants A, B and C touch different properties and
@@ -65,12 +68,58 @@ state (only sentinel wanted level and faction standing). It would need a code ho
 plugin patching the freighter AI), which is a different class of mod with its own
 anti-cheat/compatibility caveats. Variant B is the data-only approximation.
 
+## Publishing: keeping a deterrent against deliberate attacks
+
+Variant A works but is not publishable as-is: with the attack threshold unreachable, a player can
+sit next to a civilian freighter and destroy its cargo pods for loot without the freighter ever
+shooting back. Three facts from the data decide how to close that hole:
+
+1. **The freighter's hostility is one counter, fed by hits.** There is no separate "the player
+   destroyed something" trigger in the globals. Whatever you do to the counter applies to
+   stray shots and to deliberate pod fire alike. The only lever that separates them is
+   *intensity*: a stray hit is one shot every many seconds, a pod kill is continuous fire.
+2. **Pod destruction has its own penalties that do not go through that counter.** The capital
+   freighter cargo pods are the `CONTAINER_A` to `CONTAINER_H` entities under
+   `MODELS/COMMON/SPACECRAFT/INDUSTRIAL/CONTAINER/`. Their destructible component carries
+   `StandingChangeOnDeath` (a community "NoStandingLoss" script zeroes exactly that field on
+   exactly those files) and `IncreaseWanted`, and the shootable component carries its own
+   `IncreaseWanted` with a threshold time. So even under variant A, farming pods costs faction
+   standing and summons sentinels. The AMUMSS script additionally forces
+   `NoConsequencesDuringPirateBattle` to false on those entities so a running battle does not
+   suspend the penalties.
+3. **Hello Games' own "unless the shot is fatal" rule exists only for escort traders**, not
+   for the freighter (Beyond patch notes). A data-only mod cannot add it to the freighter.
+
+So the publishable choice is **F (strict)**: multiply both alert thresholds by five and leave
+decay alone. Accidental hits need a budget five times larger than vanilla before the hangar
+closes, which covers "extremely careful" play with margin, while a deliberate pod attack still
+trips hostility in seconds and persists like vanilla. It is the smallest deviation from vanilla
+that fixes the complaint, so it is also the easiest to defend on a mod page. If five turns out to
+be too tight or too loose, it is one number.
+
+**E (forgive)** is the alternative if you prefer the freighter to calm down on its own. It keeps
+the retaliation during an attack and the pod penalties, but hostility fades about 15 s after the
+last hit, so a raider gets docking rights back quickly. Say so on the mod page if you ship it.
+
+Both are defined relative to your game's vanilla values, which are not published anywhere, so
+either build with the AMUMSS script (it multiplies in place) or generate the EXML:
+
+```
+python3 tools/read_globals.py  path/to/GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN   # see the vanilla numbers
+python3 tools/make_variant.py --mode strict --mbin path/to/GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN
+```
+
+The generated folder under `variants/E-Calibrated/GAMEDATA/MODS/` installs like any other variant.
+Test protocol for F: (1) careful battle, expect open hangar; (2) deliberately kill one pod with
+sustained fire, expect hostility, sentinels and a standing hit; (3) if (1) still closes the hangar,
+raise `--threshold-mult`; if (2) never trips, lower it.
+
 ## Building it yourself / other mods that edit the same file
 
 `amumss/FreighterFriendlyFireTolerance.lua` builds the same patch with
 [AMUMSS](https://github.com/HolterPhylo/AMUMSS) from your own game files, prints the vanilla
 values it replaces, and merges with other scripts that touch `GCAISPACESHIPGLOBALS`. Set
-`VARIANT` at the top of the script.
+`VARIANT` at the top of the script (`F` by default); `PODS_KEEP_CONSEQUENCES` also patches the cargo-pod entities.
 
 `tools/read_globals.py` prints the vanilla values of every field this mod cares about straight
 from an extracted `.MBIN` (no .NET needed), with a sanity check that the struct offsets still
