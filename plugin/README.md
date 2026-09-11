@@ -15,14 +15,25 @@ Layer 2 needs two byte patterns you must extract from your `NMS.exe`.
 ## Requirements
 
 * Windows, Steam or GOG `NMS.exe` 7.x. NMS.py `170671.6` targets the Cosmos-era build.
-* Python 3.10 to 3.13 from python.org (not the Store build). NMS.py notes 3.14 is not yet supported.
-* `pip install "pymhf[gui]" nmspy`
+* **Python 3.10, 3.11, 3.12 or 3.13** from python.org (not the Store build). NMS.py's package
+  metadata claims 3.9, but its code uses `float | None` annotations that only parse on 3.10+, and
+  its README says 3.14 is not yet supported. Python 3.9 fails at import with
+  `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`.
+* Install into that interpreter and run pyMHF from it, because pyMHF injects the interpreter it is
+  running under into the game:
+
+  ```
+  py -3.12 -m pip install --user --upgrade "pymhf[gui]" nmspy prompt_toolkit questionary
+  py -3.12 -m pymhf run C:\path\to\plugin\freighter_class_peek.py
+  ```
 
 ## Run
 
 ```
-pymhf run path\to\plugin\freighter_class_peek.py
+py -3.12 -m pymhf run path\to\plugin\freighter_class_peek.py
 ```
+
+(`pymhf run ...` also works if the `pymhf` script on your PATH belongs to the 3.10+ install.)
 
 pyMHF launches the game (or attaches, per its config), opens a GUI window with a tab for this mod
 and a log window. Alternatively copy the file into `GAMEDATA\MODS\` and run `pymhf run nmspy`,
@@ -93,6 +104,19 @@ If you get the patterns, contributing them upstream to NMS.py (`tools/data.json`
 `nmspy/data/types.py`) helps everyone.
 
 ## Troubleshooting
+
+Logs survive the console window: both the launcher and the injected process write
+`pymhf-<timestamp>.log` into the log directory, which for this single-file mod is the `plugin\`
+folder itself (`log_dir = "."`). Pattern offsets are cached per exe hash in
+`plugin\.freighter_class_peek.cache\`; deleting that folder forces a rescan.
+
+**`TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` from
+`nmspy\data\basic_types.py`**: you are on Python 3.9. NMS.py needs 3.10 or newer (see Requirements).
+Install 3.12 and run pyMHF with `py -3.12 -m pymhf ...`.
+
+**Safety switches**: `USE_GET_CALLER` and `ENABLE_HUD_ANNOUNCE` at the top of the mod file are off
+by default. The first only matters for caller-address calibration; the second only for the in-game
+HUD message. Turn them on one at a time after the mod is confirmed to load and report inventories.
 
 **`AttributeError: 'NoneType' object has no attribute 'isatty'` from `questionary`/`prompt_toolkit`
 during injection, then "pyMHF exiting..."**

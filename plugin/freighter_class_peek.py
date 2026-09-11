@@ -79,6 +79,18 @@ KNOWN_GENERATION_CALLERS: set[int] = set()
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
 
+# Record the address of the code that called cGcInventoryStore::Add (needed for caller-based
+# calibration). pyMHF implements this by rewriting bytes inside minhook's trampoline for the hooked
+# function; Add is called constantly, so this is the riskiest part of the mod. Off for the first run;
+# turn on once the mod is known to load cleanly.
+USE_GET_CALLER = False
+
+# Hook cGcPlayerNotifications::AddTimedMessage so the mod can show HUD messages. NMS.py marks that
+# function's argument list as unconfirmed since 4.13, and a hook re-calls the original with the
+# declared arguments, so a wrong list can crash the game the first time it shows any timed message.
+# Off by default; the pyMHF window shows the result regardless.
+ENABLE_HUD_ANNOUNCE = False
+
 # Delay before a newly touched store is inspected, so the generator has finished writing it.
 SETTLE_SECONDS = 0.25
 
@@ -206,7 +218,7 @@ class FreighterClassPeek(Mod):
         self.state.calibration_logging = value
 
     @property
-    @BOOLEAN("Announce in-game (experimental, may crash)")
+    @BOOLEAN("Announce in-game (needs ENABLE_HUD_ANNOUNCE=True in file)")
     def announce_in_game(self) -> bool:
         return self.state.announce_in_game
 
@@ -230,8 +242,6 @@ class FreighterClassPeek(Mod):
 
     # ---------------------------------------------------------------- Hooks: Layer 1
 
-    @get_caller
-    @nms.cGcInventoryStore.Add.after
     def _after_add(
         self,
         this: _Pointer[nms.cGcInventoryStore],
@@ -240,7 +250,7 @@ class FreighterClassPeek(Mod):
     ):
         try:
             addr = get_addressof(this)
-            caller = self._after_add.caller_address()
+            caller = self._after_add.caller_address() if USE_GET_CALLER else 0
         except Exception:  # never let a detour raise into the game
             return
         if self._is_player_store(addr):
@@ -253,15 +263,23 @@ class FreighterClassPeek(Mod):
             t0, c0, g0 = self._pending[addr]
             self._pending[addr] = (time.time(), c0, g0 or self._in_generate)
 
-    @nms.cGcPlayerNotifications.AddTimedMessage.after
-    def _capture_notifications(self, this, *args):
-        # Grab the cGcPlayerNotifications instance the first time the game shows any timed message.
-        if not self._notifications_addr:
-            try:
-                self._notifications_addr = get_addressof(this)
-                logger.info(f"Captured cGcPlayerNotifications at 0x{self._notifications_addr:X}")
-            except Exception:
-                pass
+    # Apply the hook decorator (and optionally the caller capture) to the method defined above.
+    if USE_GET_CALLER:
+        _after_add = get_caller(nms.cGcInventoryStore.Add.after(_after_add))
+    else:
+        _after_add = nms.cGcInventoryStore.Add.after(_after_add)
+
+    if ENABLE_HUD_ANNOUNCE:
+
+        @nms.cGcPlayerNotifications.AddTimedMessage.after
+        def _capture_notifications(self, this, *args):
+            # Grab the cGcPlayerNotifications instance the first time the game shows any timed message.
+            if not self._notifications_addr:
+                try:
+                    self._notifications_addr = get_addressof(this)
+                    logger.info(f"Captured cGcPlayerNotifications at 0x{self._notifications_addr:X}")
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
 
@@ -383,7 +401,7 @@ class FreighterClassPeek(Mod):
     def _announce(self, text: str):
         """Show a timed HUD message. Off by default: the AddTimedMessage argument list in NMS.py is
         annotated as unconfirmed since 4.13, so a wrong call can crash the game."""
-        if not self.state.announce_in_game or not self._notifications_addr:
+        if not ENABLE_HUD_ANNOUNCE or not self.state.announce_in_game or not self._notifications_addr:
             return
         try:
             notif = map_struct(self._notifications_addr, nms.cGcPlayerNotifications)
