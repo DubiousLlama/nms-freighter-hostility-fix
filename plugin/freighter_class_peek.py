@@ -432,17 +432,27 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "StoreGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),  # 4 register + 4 stack slots, passed through
             detour_time="before",
         )
-        def _generator_before(self, this, lpSeed, liArg, lbArg):
+        def _generator_before(self, this, lpSeed, liArg, lbArg, *_stack):
             self._in_generate = True
             self._generate_component = int(this)
             try:
                 caller = self._generator_before.caller_address()
                 logger.info(f"store generator called from NMS+0x{caller:X} (resolve this to hook the component generator)")
             except Exception:
-                pass
+                caller = 0
+            if self._in_visor_scan:
+                try:
+                    chain = self._stack_return_addresses()
+                    # Drop everything below (and including) the immediate caller: those are pyMHF/Python frames.
+                    if caller in chain:
+                        chain = chain[chain.index(caller):]
+                    logger.info("call chain during scan, innermost first: " + ", ".join(f"NMS+0x{a:X}" for a in chain[:12]))
+                    logger.info("resolve the 2nd/3rd entries with the finder; the component generator is one of them")
+                except Exception as e:
+                    logger.error(f"stack walk failed: {e}")
             arg32 = int(liArg) & 0xFFFFFFFF
             flag8 = int(lbArg) & 0xFF
             self._generated_components.append((time.time(), int(this), arg32, flag8))
@@ -460,10 +470,10 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "StoreGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),  # 4 register + 4 stack slots, passed through
             detour_time="after",
         )
-        def _generator_after(self, this, lpSeed, liArg, lbArg):
+        def _generator_after(self, this, lpSeed, liArg, lbArg, *_stack):
             self._in_generate = False
             try:
                 store = map_struct(int(this), nms.cGcInventoryStore)
@@ -478,10 +488,10 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "AIShipComponentGenerateInventory",
             offset=AI_GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),  # 4 register + 4 stack slots, passed through
             detour_time="before",
         )
-        def _ai_generator_before(self, this, a1, a2, a3):
+        def _ai_generator_before(self, this, a1, a2, a3, *_stack):
             self._generated_components.append((time.time(), int(this), int(a2) & 0xFFFFFFFF, int(a3) & 0xFF))
             extra = ""
             try:
@@ -615,6 +625,63 @@ class FreighterClassPeek(Mod):
             else:
                 logger.info(f"burst of {len(self._burst)} small stores [{desc}]")
         self._burst = []
+
+    # ---------------------------------------------------------------- Stack walk
+
+    def _stack_return_addresses(self, max_frames: int = 16) -> list[int]:
+        """Scan the current thread's committed stack for return addresses into NMS.exe (qwords inside the
+        image whose preceding bytes form a CALL instruction). Innermost first. Heuristic, but on x64 MSVC
+        code it recovers the real chain in practice because every frame keeps its return address on the
+        stack. Windows only (uses kernel32)."""
+        k32 = ctypes.windll.kernel32
+        lo, hi = ctypes.c_uint64(), ctypes.c_uint64()
+        k32.GetCurrentThreadStackLimits(ctypes.byref(lo), ctypes.byref(hi))
+
+        class MBI(ctypes.Structure):
+            _fields_ = [("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
+                        ("AllocationProtect", ctypes.c_uint32), ("PartitionId", ctypes.c_uint16),
+                        ("RegionSize", ctypes.c_uint64), ("State", ctypes.c_uint32),
+                        ("Protect", ctypes.c_uint32), ("Type", ctypes.c_uint32)]
+
+        k32.VirtualQuery.restype = ctypes.c_size_t
+        k32.VirtualQuery.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
+        found: list[int] = []
+        addr = lo.value
+        img_lo, img_hi = BASE_ADDRESS, BASE_ADDRESS + SIZE_OF_IMAGE
+        import struct as _struct
+        while addr < hi.value:
+            mbi = MBI()
+            if not k32.VirtualQuery(addr, ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                break
+            end = min(mbi.BaseAddress + mbi.RegionSize, hi.value)
+            committed = mbi.State == 0x1000 and not (mbi.Protect & 0x100) and (mbi.Protect & 0x04)
+            if committed:
+                try:
+                    buf = ctypes.string_at(addr, end - addr)
+                    for (q,) in _struct.iter_unpack("<Q", buf[: len(buf) - len(buf) % 8]):
+                        if img_lo <= q < img_hi:
+                            try:
+                                pre = ctypes.string_at(q - 7, 7)
+                            except Exception:
+                                continue
+                            is_call = (
+                                pre[2] == 0xE8                                   # call rel32
+                                or (pre[1] == 0xFF and pre[2] == 0x15)           # call [rip+rel32]
+                                or (pre[5] == 0xFF and 0xD0 <= pre[6] <= 0xD7)   # call reg
+                                or (pre[4] == 0x41 and pre[5] == 0xFF and 0xD0 <= pre[6] <= 0xD7)  # call r8-r15
+                                or (pre[4] == 0xFF and pre[5] in (0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57))  # call [reg+disp8]
+                                or (pre[1] == 0xFF and pre[2] in (0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97))  # call [reg+disp32]
+                            )
+                            if is_call:
+                                rel = q - BASE_ADDRESS
+                                if not found or found[-1] != rel:
+                                    found.append(rel)
+                                if len(found) >= max_frames + 8:
+                                    break
+                except Exception:
+                    pass
+            addr = end
+        return found
 
     # ---------------------------------------------------------------- Helpers
 
