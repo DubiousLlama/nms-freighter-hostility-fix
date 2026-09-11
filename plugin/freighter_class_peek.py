@@ -237,6 +237,41 @@ class FreighterClassPeek(Mod):
         logger.info(f"Last freighter-sized inventory: {self.state.last_freighter}")
         self._announce(self.state.last_freighter)
 
+    @gui_button("Dump player inventories (validates struct offsets)")
+    def dump_player_inventories(self):
+        """Print the player's own inventory stores through the same field map used for NPC stores.
+        Compare with what you actually own: suit grid, each ship's class and size, freighter, exocraft.
+        Sensible output means the cGcInventoryStore/cGcPlayerState offsets fit this game build;
+        nonsense means NMS.py is stale for this build and every NPC line above is suspect too."""
+        ps = gameData.player_state
+        if ps is None:
+            logger.error("player_state not available (load a save first)")
+            return
+        logger.info(f"player_state at 0x{get_addressof(ps):X}; units={ps.muUnits} nanites={ps.muNanites} "
+                    f"primary ship index={ps.miPrimaryShip}")
+        for attr in ("mInventories", "mShipInventories", "mShipInventoriesCargo", "mShipInventoriesTechOnly",
+                     "mVehicleInventories", "mVehicleTechInventories"):
+            try:
+                arr = getattr(ps, attr)
+            except Exception as e:
+                logger.error(f"{attr}: {e}")
+                continue
+            for i, store in enumerate(arr):
+                try:
+                    w, h = int(store.miWidth), int(store.miHeight)
+                    if w == 0 and h == 0 and len(store.mStore) == 0:
+                        continue
+                    try:
+                        name = str(store.mInventoryName).strip("\x00")
+                    except Exception:
+                        name = "?"
+                    logger.info(
+                        f"  {attr}[{i}] @0x{get_addressof(store):X}: {w}x{h} cap={int(store.miCapacity)} "
+                        f"items={len(store.mStore)} class={self._class_name(store)} name={name or '-'}"
+                    )
+                except Exception as e:
+                    logger.error(f"  {attr}[{i}]: {e}")
+
     @gui_button("Dump caller statistics to log")
     def dump_callers(self):
         for caller, n in sorted(self._seen_callers.items(), key=lambda kv: -kv[1]):
