@@ -443,12 +443,9 @@ class FreighterClassPeek(Mod):
                 logger.info(f"store generator called from NMS+0x{caller:X} (resolve this to hook the component generator)")
             except Exception:
                 caller = 0
-            if self._in_visor_scan:
+            if self._in_visor_scan and caller:
                 try:
-                    chain = self._stack_return_addresses()
-                    # Drop everything below (and including) the immediate caller: those are pyMHF/Python frames.
-                    if caller in chain:
-                        chain = chain[chain.index(caller):]
+                    chain = self._stack_return_addresses(caller)
                     logger.info("call chain during scan, innermost first: " + ", ".join(f"NMS+0x{a:X}" for a in chain[:12]))
                     logger.info("resolve the 2nd/3rd entries with the finder; the component generator is one of them")
                 except Exception as e:
@@ -628,11 +625,14 @@ class FreighterClassPeek(Mod):
 
     # ---------------------------------------------------------------- Stack walk
 
-    def _stack_return_addresses(self, max_frames: int = 16) -> list[int]:
-        """Scan the current thread's committed stack for return addresses into NMS.exe (qwords inside the
-        image whose preceding bytes form a CALL instruction). Innermost first. Heuristic, but on x64 MSVC
-        code it recovers the real chain in practice because every frame keeps its return address on the
-        stack. Windows only (uses kernel32)."""
+    def _stack_return_addresses(self, anchor_rel: int, max_frames: int = 16) -> list[int]:
+        """Recover the live call chain outward from a known return address.
+
+        Scans the thread's committed stack for qwords that point into NMS.exe right after a CALL
+        instruction. Dead frames below the current stack pointer also contain such values, so the
+        known immediate caller (`anchor_rel`, from pyMHF's caller capture) is used as the anchor: its
+        highest occurrence is the live frame, and the matching values above it, in ascending address
+        order, are the outer frames. Windows only (uses kernel32)."""
         k32 = ctypes.windll.kernel32
         lo, hi = ctypes.c_uint64(), ctypes.c_uint64()
         k32.GetCurrentThreadStackLimits(ctypes.byref(lo), ctypes.byref(hi))
@@ -645,10 +645,26 @@ class FreighterClassPeek(Mod):
 
         k32.VirtualQuery.restype = ctypes.c_size_t
         k32.VirtualQuery.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
-        found: list[int] = []
-        addr = lo.value
         img_lo, img_hi = BASE_ADDRESS, BASE_ADDRESS + SIZE_OF_IMAGE
+        anchor_abs = BASE_ADDRESS + anchor_rel
         import struct as _struct
+
+        def is_call_site(q: int) -> bool:
+            try:
+                pre = ctypes.string_at(q - 7, 7)
+            except Exception:
+                return False
+            return (
+                pre[2] == 0xE8                                                  # call rel32
+                or (pre[1] == 0xFF and pre[2] == 0x15)                          # call [rip+rel32]
+                or (pre[5] == 0xFF and 0xD0 <= pre[6] <= 0xD7)                  # call reg
+                or (pre[4] == 0x41 and pre[5] == 0xFF and 0xD0 <= pre[6] <= 0xD7)  # call r8..r15
+                or (pre[4] == 0xFF and pre[5] in (0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57))  # call [reg+disp8]
+                or (pre[1] == 0xFF and pre[2] in (0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97))  # call [reg+disp32]
+            )
+
+        hits: list[tuple[int, int]] = []  # (stack address, value)
+        addr = lo.value
         while addr < hi.value:
             mbi = MBI()
             if not k32.VirtualQuery(addr, ctypes.byref(mbi), ctypes.sizeof(mbi)):
@@ -658,30 +674,27 @@ class FreighterClassPeek(Mod):
             if committed:
                 try:
                     buf = ctypes.string_at(addr, end - addr)
-                    for (q,) in _struct.iter_unpack("<Q", buf[: len(buf) - len(buf) % 8]):
+                    for i, (q,) in enumerate(_struct.iter_unpack("<Q", buf[: len(buf) - len(buf) % 8])):
                         if img_lo <= q < img_hi:
-                            try:
-                                pre = ctypes.string_at(q - 7, 7)
-                            except Exception:
-                                continue
-                            is_call = (
-                                pre[2] == 0xE8                                   # call rel32
-                                or (pre[1] == 0xFF and pre[2] == 0x15)           # call [rip+rel32]
-                                or (pre[5] == 0xFF and 0xD0 <= pre[6] <= 0xD7)   # call reg
-                                or (pre[4] == 0x41 and pre[5] == 0xFF and 0xD0 <= pre[6] <= 0xD7)  # call r8-r15
-                                or (pre[4] == 0xFF and pre[5] in (0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57))  # call [reg+disp8]
-                                or (pre[1] == 0xFF and pre[2] in (0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97))  # call [reg+disp32]
-                            )
-                            if is_call:
-                                rel = q - BASE_ADDRESS
-                                if not found or found[-1] != rel:
-                                    found.append(rel)
-                                if len(found) >= max_frames + 8:
-                                    break
+                            hits.append((addr + 8 * i, q))
                 except Exception:
                     pass
             addr = end
-        return found
+
+        anchors = [sa for sa, v in hits if v == anchor_abs]
+        if not anchors:
+            logger.error(f"anchor NMS+0x{anchor_rel:X} not found on the stack; chain unavailable")
+            return []
+        live = max(anchors)
+        chain = [anchor_rel]
+        for sa, v in hits:
+            if sa > live and is_call_site(v):
+                rel = v - BASE_ADDRESS
+                if chain[-1] != rel:
+                    chain.append(rel)
+                if len(chain) >= max_frames:
+                    break
+        return chain
 
     # ---------------------------------------------------------------- Helpers
 
