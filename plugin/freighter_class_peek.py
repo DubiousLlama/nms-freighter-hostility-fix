@@ -89,6 +89,13 @@ GENERATOR_FUNCTION_OFFSET = 0
 # press "Find function start". The GUI field, if filled, takes precedence.
 CALLER_ADDRESS_TO_RESOLVE = 0
 
+# Step 3: the function at GENERATOR_FUNCTION_OFFSET turned out to be a cGcInventoryStore method
+# (its `this` is the store). The AI ship component's own generator is its caller. With
+# GENERATOR_FUNCTION_OFFSET set, the mod logs "store generator called from NMS+0x..."; resolve that
+# address with the finder and put the function start here to hook the component-level generator and
+# log the component pointer (`this`) and the seed it passes.
+AI_GENERATOR_FUNCTION_OFFSET = 0
+
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
 
@@ -421,8 +428,9 @@ class FreighterClassPeek(Mod):
 
     if GENERATOR_FUNCTION_OFFSET:
 
+        @get_caller
         @manual_hook(
-            "AIShipGenerateInventory",
+            "StoreGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
             func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
             detour_time="before",
@@ -430,6 +438,11 @@ class FreighterClassPeek(Mod):
         def _generator_before(self, this, lpSeed, liArg, lbArg):
             self._in_generate = True
             self._generate_component = int(this)
+            try:
+                caller = self._generator_before.caller_address()
+                logger.info(f"store generator called from NMS+0x{caller:X} (resolve this to hook the component generator)")
+            except Exception:
+                pass
             arg32 = int(liArg) & 0xFFFFFFFF
             flag8 = int(lbArg) & 0xFF
             self._generated_components.append((time.time(), int(this), arg32, flag8))
@@ -445,13 +458,40 @@ class FreighterClassPeek(Mod):
             )
 
         @manual_hook(
-            "AIShipGenerateInventory",
+            "StoreGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
             func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
             detour_time="after",
         )
         def _generator_after(self, this, lpSeed, liArg, lbArg):
             self._in_generate = False
+            try:
+                store = map_struct(int(this), nms.cGcInventoryStore)
+                logger.info(f"store generator done: store 0x{int(this):X} now class {self._class_name(store)} "
+                            f"{int(store.miWidth)}x{int(store.miHeight)}")
+            except Exception:
+                pass
+
+    if AI_GENERATOR_FUNCTION_OFFSET:
+
+        @manual_hook(
+            "AIShipComponentGenerateInventory",
+            offset=AI_GENERATOR_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),
+            detour_time="before",
+        )
+        def _ai_generator_before(self, this, a1, a2, a3):
+            self._generated_components.append((time.time(), int(this), int(a2) & 0xFFFFFFFF, int(a3) & 0xFF))
+            extra = ""
+            try:
+                if int(a1) > 0x10000:
+                    extra = " a1 bytes=" + ctypes.string_at(int(a1), 16).hex(" ").upper()
+            except Exception:
+                pass
+            logger.info(
+                f"component generator(this=0x{int(this):X}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) "
+                f"visor_scan={self._in_visor_scan}{extra}"
+            )
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
 
