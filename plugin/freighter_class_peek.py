@@ -96,14 +96,6 @@ CALLER_ADDRESS_TO_RESOLVE = 0
 # log the component pointer (`this`) and the seed it passes.
 AI_GENERATOR_FUNCTION_OFFSET = 0  # 0x4CA440 crashed (stack args); the stack walk below replaces this hook
 
-# Force-autosave support. The game's save entry point is cGcGameState::SaveProgress(this, saveType, bool,
-# bool, cGcPlayerSpawnStateData*, uint, bool) (4.13 signature). NMS.py has no current pattern for it, but
-# it does hook cGcPlayerState::SaveToData, which runs inside every save: do one natural autosave (exit the
-# ship on a planet), read the "save chain" line, resolve the first entry outside the player-state code with
-# the finder, and put the function start here. The mod then records the exact arguments of the next natural
-# autosave and the "Force autosave" button replays that call on the game thread.
-SAVE_FUNCTION_OFFSET = 0
-
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
 
@@ -217,9 +209,6 @@ class FreighterClassPeek(Mod):
         self._pending_scan_t = 0.0
         self._last_scan_node = 0
         self._generated_components: deque[tuple[float, int, int, int]] = deque(maxlen=16)  # (t, this, arg, flag)
-        self._last_save_chain_t = 0.0
-        self._save_call_args: Optional[tuple[int, ...]] = None  # (this, a1..a7) recorded from a natural save
-        self._force_save_requested = False
 
     # ---------------------------------------------------------------- GUI
 
@@ -375,55 +364,6 @@ class FreighterClassPeek(Mod):
             head = ctypes.string_at(BASE_ADDRESS + c, 12).hex(" ").upper()
             logger.info(f"function start candidate: NMS+0x{c:X}  (0x{rel - c:X} bytes before the caller)  bytes: {head}")
         logger.info(f"Put the nearest candidate into GENERATOR_FUNCTION_OFFSET (e.g. 0x{candidates[0]:X}) and reload.")
-
-    @gui_button("Force autosave (needs SAVE_FUNCTION_OFFSET and one recorded natural save)")
-    def force_autosave(self):
-        if not SAVE_FUNCTION_OFFSET:
-            logger.error("SAVE_FUNCTION_OFFSET is 0: do a natural autosave, read the 'save chain' line, resolve it, set the offset.")
-            return
-        if self._save_call_args is None:
-            logger.error("No natural save recorded yet with the save hook active: exit your ship on a planet once, then retry.")
-            return
-        self._force_save_requested = True
-        logger.info("force autosave queued; it runs on the next game frame")
-
-    # ---------------------------------------------------------------- Hooks: save path
-
-    @get_caller
-    @nms.cGcPlayerState.SaveToData.before
-    def _save_to_data_before(self, this, lData):
-        now = time.time()
-        if now - self._last_save_chain_t < 2.0:
-            return
-        self._last_save_chain_t = now
-        try:
-            caller = self._save_to_data_before.caller_address()
-        except Exception:
-            caller = 0
-        logger.info(f"save in progress: cGcPlayerState::SaveToData called from NMS+0x{caller:X}")
-        if caller:
-            try:
-                chain = self._stack_return_addresses(caller)
-                logger.info("save chain, innermost first: " + ", ".join(f"NMS+0x{a:X}" for a in chain[:12]))
-                logger.info("resolve the entry just outside the player-state code with the finder -> SAVE_FUNCTION_OFFSET")
-            except Exception as e:
-                logger.error(f"save stack walk failed: {e}")
-
-    if SAVE_FUNCTION_OFFSET:
-
-        @manual_hook(
-            "GameStateSaveProgress",
-            offset=SAVE_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),
-            detour_time="before",
-        )
-        def _save_progress_before(self, this, a1, a2, a3, a4, a5, a6, a7):
-            args = tuple(int(x) for x in (this, a1, a2, a3, a4, a5, a6, a7))
-            self._save_call_args = args
-            logger.info(
-                "natural save call recorded: SaveProgress(this=0x{:X}, type=0x{:X}, b1=0x{:X}, b2=0x{:X}, "
-                "spawn*=0x{:X}, u=0x{:X}, b3=0x{:X}, stack4=0x{:X})".format(*args)
-            )
 
     # ---------------------------------------------------------------- Hooks: Layer 1
 
@@ -610,9 +550,6 @@ class FreighterClassPeek(Mod):
 
     @main_loop.after
     def _process_pending(self):
-        if self._force_save_requested:
-            self._force_save_requested = False
-            self._do_force_save()
         if self._burst and time.time() - self._burst_t > 1.0:
             self._flush_burst()
         if not self._pending:
@@ -685,22 +622,6 @@ class FreighterClassPeek(Mod):
             else:
                 logger.info(f"burst of {len(self._burst)} small stores [{desc}]")
         self._burst = []
-
-    def _do_force_save(self):
-        """Replay the last recorded SaveProgress call on the game thread. The fifth argument is a pointer the
-        game passed at the time (cGcPlayerSpawnStateData*); if it was a stack temporary it may be stale, so
-        the replay passes 0 for it unless FORCE_SAVE_KEEP_SPAWN_PTR is set in the file."""
-        try:
-            fn = ctypes.CFUNCTYPE(c_uint64, *([c_uint64] * 8))(BASE_ADDRESS + SAVE_FUNCTION_OFFSET)
-            this, a1, a2, a3, a4, a5, a6, a7 = self._save_call_args
-            if not globals().get("FORCE_SAVE_KEEP_SPAWN_PTR", False):
-                a4 = 0
-            logger.info(f"forcing save: SaveProgress(this=0x{this:X}, type=0x{a1:X}, b1=0x{a2:X}, b2=0x{a3:X}, "
-                        f"spawn*=0x{a4:X}, u=0x{a5:X}, b3=0x{a6:X})")
-            fn(this, a1, a2, a3, a4, a5, a6, a7)
-            logger.info("forced save call returned")
-        except Exception as e:
-            logger.error(f"forced save failed: {e}")
 
     # ---------------------------------------------------------------- Stack walk
 

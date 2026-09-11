@@ -172,24 +172,6 @@ python -m pip install --user --upgrade prompt_toolkit questionary
 
 then run again. This is independent of the mod and of the `start_paused` setting.
 
-## Force autosave (experiment support)
-
-To test whether saving and reloading before the first scan changes the class, the mod can replay
-the game's own save call:
-
-1. Pull, reload, and do one natural autosave (exit your ship on a planet or station). The log
-   prints `save in progress: cGcPlayerState::SaveToData called from NMS+0x...` and a `save chain`
-   line. Resolve the first chain entry that is outside the player-state code with the finder and
-   set `SAVE_FUNCTION_OFFSET` to that function start.
-2. Reload and do one more natural autosave. The log prints `natural save call recorded:
-   SaveProgress(...)` with the exact arguments the game used.
-3. Press **Force autosave**. The call is replayed on the next game frame with those arguments
-   (the spawn-state pointer is replaced by 0 unless `FORCE_SAVE_KEEP_SPAWN_PTR = True` is added to
-   the file, because it may point to a stack temporary). Expect the usual save icon.
-
-This is the riskiest feature in the mod: a wrong offset or an argument the game no longer accepts
-crashes the game. Use it on a save you can afford to lose.
-
 ## Caveats
 
 * Game updates change patterns and offsets. When NMS.py updates, this mod usually follows; when
