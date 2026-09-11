@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+plugin/.*.cache/
+plugin/pymhf-*.log
