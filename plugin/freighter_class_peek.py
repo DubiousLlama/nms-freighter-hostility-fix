@@ -424,22 +424,30 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "AIShipGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_int, c_bool]),
+            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
             detour_time="before",
         )
         def _generator_before(self, this, lpSeed, liArg, lbArg):
             self._in_generate = True
             self._generate_component = int(this)
-            self._generated_components.append((time.time(), int(this), int(liArg), int(bool(lbArg))))
+            arg32 = int(liArg) & 0xFFFFFFFF
+            flag8 = int(lbArg) & 0xFF
+            self._generated_components.append((time.time(), int(this), arg32, flag8))
+            seed_txt = ""
+            try:
+                if int(lpSeed) > 0x10000:
+                    seed_txt = " seed bytes=" + ctypes.string_at(int(lpSeed), 16).hex(" ").upper()
+            except Exception:
+                pass
             logger.info(
-                f"generator(this=0x{int(this):X}, seed*=0x{int(lpSeed):X}, arg={int(liArg)}, flag={bool(lbArg)}) "
-                f"visor_scan={self._in_visor_scan}"
+                f"generator(this=0x{int(this):X}, seed*=0x{int(lpSeed):X}, arg={arg32} (raw 0x{int(liArg):X}), "
+                f"flag={flag8} (raw 0x{int(lbArg):X})) visor_scan={self._in_visor_scan}{seed_txt}"
             )
 
         @manual_hook(
             "AIShipGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_int, c_bool]),
+            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
             detour_time="after",
         )
         def _generator_after(self, this, lpSeed, liArg, lbArg):
