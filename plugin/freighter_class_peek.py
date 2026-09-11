@@ -94,7 +94,7 @@ CALLER_ADDRESS_TO_RESOLVE = 0
 # GENERATOR_FUNCTION_OFFSET set, the mod logs "store generator called from NMS+0x..."; resolve that
 # address with the finder and put the function start here to hook the component-level generator and
 # log the component pointer (`this`) and the seed it passes.
-AI_GENERATOR_FUNCTION_OFFSET = 0x4CA440
+AI_GENERATOR_FUNCTION_OFFSET = 0  # 0x4CA440 crashed (stack args); the stack walk below replaces this hook
 
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
