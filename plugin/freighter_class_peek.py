@@ -50,7 +50,9 @@ from dataclasses import dataclass
 from typing import Annotated, Optional
 
 from pymhf import Mod, ModState
-from pymhf.core.hooking import Structure, function_hook, get_caller, on_key_pressed
+from pymhf import FUNCDEF
+from pymhf.core._internal import BASE_ADDRESS
+from pymhf.core.hooking import Structure, function_hook, get_caller, manual_hook, on_key_pressed
 from pymhf.core.memutils import get_addressof, map_struct
 from pymhf.gui.decorators import BOOLEAN, INTEGER, STRING, gui_button
 
@@ -75,6 +77,13 @@ SIG_GENERATE_PROCEDURAL_CLASS = ""  # cGcInventoryStore::GenerateProceduralClass
 # Layer 1 calibration: relative addresses (NMS.exe+X) of the code that calls cGcInventoryStore::Add
 # while an NPC ship inventory is generated. Fill from the calibration log (see README). Optional.
 KNOWN_GENERATION_CALLERS: set[int] = set()
+
+# Step-2 hook: once the caller-address calibration (USE_GET_CALLER) has shown where cGcInventoryStore::Add
+# is called from during a visor scan of a freighter, use the "Find function start" button to turn that
+# return address into the start of the enclosing function, and put it here (relative to NMS.exe, e.g.
+# 0x11F7610). The mod then hooks that function as cGcAISpaceshipComponent::GenerateInventory(this, seed*,
+# int, bool) and logs the component pointer and arguments every time the game generates an NPC inventory.
+GENERATOR_FUNCTION_OFFSET = 0
 
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
@@ -157,6 +166,7 @@ class PeekState(ModState):
     calibration_logging: bool = True
     min_slots: int = MIN_SLOTS_FOR_FREIGHTER
     last_freighter: str = "none seen yet"
+    caller_to_resolve: int = 0
 
 
 # ============================================================================================
@@ -184,6 +194,10 @@ class FreighterClassPeek(Mod):
         self._known_stores: dict[int, str] = {}  # store_addr -> last class reported
         self._burst: list[InventoryEvent] = []
         self._burst_t = 0.0
+        self._in_visor_scan = False
+        self._pending_scan_t = 0.0
+        self._last_scan_node = 0
+        self._generated_components: deque[tuple[float, int, int, int]] = deque(maxlen=16)  # (t, this, arg, flag)
 
     # ---------------------------------------------------------------- GUI
 
@@ -281,6 +295,53 @@ class FreighterClassPeek(Mod):
     def key_reannounce(self):
         self.reannounce()
 
+    @property
+    @INTEGER("Caller address to resolve (NMS+0x..., decimal ok)")
+    def caller_to_resolve(self) -> int:
+        return self.state.caller_to_resolve
+
+    @caller_to_resolve.setter
+    def caller_to_resolve(self, value: int):
+        self.state.caller_to_resolve = int(value)
+
+    @gui_button("Find function start for caller address")
+    def find_function_start(self):
+        """Walk backwards from a return address (as logged by the caller capture) to the start of the
+        enclosing function. MSVC pads between functions with 0xCC bytes and aligns starts to 16 bytes, so the
+        first 16-aligned byte after a run of 0xCC below the address is the usual function start. Prints the
+        three nearest candidates; the nearest one is right in the large majority of cases."""
+        rel = self.state.caller_to_resolve
+        if rel <= 0:
+            logger.error("Set 'Caller address to resolve' first (from a 'caller NMS+0x...' log line)")
+            return
+        try:
+            span = 0x20000
+            start = max(0, rel - span)
+            buf = ctypes.string_at(BASE_ADDRESS + start, rel - start)
+        except Exception as e:
+            logger.error(f"Cannot read memory below NMS+0x{rel:X}: {e}")
+            return
+        candidates = []
+        i = len(buf) - 1
+        while i > 2 and len(candidates) < 3:
+            if buf[i] == 0xCC and buf[i - 1] == 0xCC:
+                j = i + 1  # first non-padding byte after the run
+                while j < len(buf) and buf[j] == 0xCC:
+                    j += 1
+                cand = start + j
+                if cand % 16 == 0 and cand not in candidates:
+                    candidates.append(cand)
+                i -= 2
+            else:
+                i -= 1
+        if not candidates:
+            logger.error("No 0xCC padding found within 128 KB below that address; use a disassembler.")
+            return
+        for c in candidates:
+            head = ctypes.string_at(BASE_ADDRESS + c, 12).hex(" ").upper()
+            logger.info(f"function start candidate: NMS+0x{c:X}  (0x{rel - c:X} bytes before the caller)  bytes: {head}")
+        logger.info(f"Put the nearest candidate into GENERATOR_FUNCTION_OFFSET (e.g. 0x{candidates[0]:X}) and reload.")
+
     # ---------------------------------------------------------------- Hooks: Layer 1
 
     def _after_add(
@@ -300,6 +361,8 @@ class FreighterClassPeek(Mod):
         # Keep the earliest caller seen for this store during the current burst of Add() calls.
         if addr not in self._pending:
             self._pending[addr] = (time.time(), caller, self._in_generate)
+            if self._in_visor_scan:
+                self._pending_scan_t = time.time()
         else:
             t0, c0, g0 = self._pending[addr]
             self._pending[addr] = (time.time(), c0, g0 or self._in_generate)
@@ -321,6 +384,50 @@ class FreighterClassPeek(Mod):
                     logger.info(f"Captured cGcPlayerNotifications at 0x{self._notifications_addr:X}")
                 except Exception:
                     pass
+
+    # ---------------------------------------------------------------- Hooks: visor scan bracket
+
+    @nms.cGcBinoculars.PopulateDiscoveryInfo.before
+    def _visor_before(self, this, lDiscoveryInfo, lpTargetNode, lpTargetAttachment, lbSubmitDiscovery, lbSilent):
+        self._in_visor_scan = True
+        self._pending_scan_t = time.time()
+        try:
+            self._last_scan_node = int(lpTargetNode.lookupInt)
+        except Exception:
+            self._last_scan_node = 0
+        logger.info(f"visor PopulateDiscoveryInfo: target node handle {self._last_scan_node} (submit={lbSubmitDiscovery})")
+
+    @nms.cGcBinoculars.PopulateDiscoveryInfo.after
+    def _visor_after(self, this, *args):
+        self._in_visor_scan = False
+
+    # ---------------------------------------------------------------- Hooks: generator by offset (step 2)
+
+    if GENERATOR_FUNCTION_OFFSET:
+
+        @manual_hook(
+            "AIShipGenerateInventory",
+            offset=GENERATOR_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_int, c_bool]),
+            detour_time="before",
+        )
+        def _generator_before(self, this, lpSeed, liArg, lbArg):
+            self._in_generate = True
+            self._generate_component = int(this)
+            self._generated_components.append((time.time(), int(this), int(liArg), int(bool(lbArg))))
+            logger.info(
+                f"generator(this=0x{int(this):X}, seed*=0x{int(lpSeed):X}, arg={int(liArg)}, flag={bool(lbArg)}) "
+                f"visor_scan={self._in_visor_scan}"
+            )
+
+        @manual_hook(
+            "AIShipGenerateInventory",
+            offset=GENERATOR_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_int, c_bool]),
+            detour_time="after",
+        )
+        def _generator_after(self, this, lpSeed, liArg, lbArg):
+            self._in_generate = False
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
 
@@ -392,6 +499,8 @@ class FreighterClassPeek(Mod):
             source = "GenerateInventory"
         elif caller in KNOWN_GENERATION_CALLERS:
             source = "caller-match"
+        elif self._in_visor_scan or (time.time() - self._pending_scan_t < SETTLE_SECONDS + 0.5):
+            source = "visor-scan"
         else:
             source = "heuristic"
         repeat = self._known_stores.get(addr) == klass
