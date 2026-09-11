@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FreighterIgnorePlayer (variant D, sledgehammer)
+  Partial patch for GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN (No Man's Sky 7.x, Cosmos).
+
+  FreighterIgnorePlayer is a developer toggle that makes NPC freighter AI ignore the player
+  entirely. It should remove player-caused hostility in all situations, including deliberate
+  cargo-pod farming, so it is broader than what this project set out to do. Use it only if
+  variants A and B both fail on your install.
+-->
+<Data template="cGcAISpaceshipGlobals">
+	<Property name="FreighterIgnorePlayer" value="true" />
+</Data>

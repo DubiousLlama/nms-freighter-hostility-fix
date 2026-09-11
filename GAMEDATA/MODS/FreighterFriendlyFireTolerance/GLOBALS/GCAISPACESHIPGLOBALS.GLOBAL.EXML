@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FreighterFriendlyFireTolerance (variant A, default)
+  Partial patch for GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN (No Man's Sky 7.x, Cosmos).
+  Only the properties listed here are overridden; everything else keeps the game's value.
+
+  FreighterAttackAlertThreshold is the accumulated "alert" a freighter must reach before it
+  turns its guns on you (and closes its hangar). Community "angry freighter" mods set it to 0
+  to make freighters hostile instantly; this mod does the opposite and raises it so that stray
+  hits during a pirate battle can never reach it.
+-->
+<Data template="cGcAISpaceshipGlobals">
+	<Property name="FreighterAttackAlertThreshold" value="1000000000.000000" />
+</Data>

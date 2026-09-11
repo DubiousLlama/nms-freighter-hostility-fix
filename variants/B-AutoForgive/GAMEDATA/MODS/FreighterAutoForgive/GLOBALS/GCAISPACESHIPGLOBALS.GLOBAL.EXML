@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FreighterAutoForgive (variant B)
+  Partial patch for GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN (No Man's Sky 7.x, Cosmos).
+
+  Leaves the hostility thresholds at the game's values (a sustained, deliberate attack still
+  angers the freighter) but makes the alert level decay almost immediately once you stop
+  hitting it: decay starts 3 s after the last registered hit and drains the whole bar in a
+  fraction of a second. Intended effect: by the time the captain hails you after the last
+  pirate dies, the freighter has already "forgiven" you and the hangar is open.
+-->
+<Data template="cGcAISpaceshipGlobals">
+	<Property name="FreighterAlertTimeOutMinTime" value="3.000000" />
+	<Property name="FreighterAlertTimeOutRate" value="1000000.000000" />
+</Data>
