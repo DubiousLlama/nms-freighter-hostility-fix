@@ -85,6 +85,10 @@ KNOWN_GENERATION_CALLERS: set[int] = set()
 # int, bool) and logs the component pointer and arguments every time the game generates an NPC inventory.
 GENERATOR_FUNCTION_OFFSET = 0
 
+# Alternative to typing into the GUI: put the "caller NMS+0x..." value here (e.g. 0x11F7A31), reload, and
+# press "Find function start". The GUI field, if filled, takes precedence.
+CALLER_ADDRESS_TO_RESOLVE = 0
+
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
 
@@ -312,9 +316,9 @@ class FreighterClassPeek(Mod):
         three nearest candidates; the nearest one is right in the large majority of cases."""
         raw = self.state.caller_to_resolve.replace("NMS+", "").strip()
         try:
-            rel = int(raw, 0) if raw else 0
+            rel = int(raw, 0) if raw else int(CALLER_ADDRESS_TO_RESOLVE)
         except ValueError:
-            rel = 0
+            rel = int(CALLER_ADDRESS_TO_RESOLVE)
         if rel <= 0:
             logger.error("Set 'Caller address to resolve' first, e.g. 0x11F7A31 (from a 'caller NMS+0x...' log line)")
             return
