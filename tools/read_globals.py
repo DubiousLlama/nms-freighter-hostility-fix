@@ -40,6 +40,15 @@ FIELDS = {
         ("FreighterBattleIgnoreFriendlyFireDistance", 0x14C4, "<f"),  # community-reported default 7200 / 10000
         ("FreighterBattleRangeBoost",                 0x14C8, "<f"),
     ],
+    # METADATA/REALITY/TABLES/INVENTORYTABLE.MBIN: class roll used for freighters (and ships) by
+    # system wealth. GcInventoryTable.ClassProbabilityData @0x1A54 = 4 x GcInventoryClassProbabilities,
+    # indexed by GcWealthClass (Poor, Average, Wealthy, Pirate); each is float[4] indexed by
+    # GcInventoryClass (C, B, A, S).
+    "INVENTORYTABLE": [
+        (f"ClassProbabilityData[{w}].{c}", 0x1A54 + wi * 16 + ci * 4, "<f")
+        for wi, w in enumerate(("Poor", "Average", "Wealthy", "Pirate"))
+        for ci, c in enumerate(("C", "B", "A", "S"))
+    ],
     "GCGAMEPLAYGLOBALS": [
         ("FreighterBattleRadius",           0x15E0, "<f"),   # community-reported default 5000
         ("FreighterCargoPodHealthFraction", 0x15E4, "<f"),   # community-reported default 0.8
@@ -48,6 +57,7 @@ FIELDS = {
 }
 
 SANITY = {
+    # each wealth row of the class table should sum to 100 (checked separately below)
     # value that, if seen, strongly suggests the offsets still line up
     "GCAISPACESHIPGLOBALS": ("FreighterAttackDisengageDistance", 3000.0),
     "GCGAMEPLAYGLOBALS":    ("FreighterBattleRadius", 5000.0),
@@ -91,6 +101,10 @@ def read(path):
         (val,) = struct.unpack_from(fmt, data, abs_off)
         values[fname] = val
         print(f"  {fname:<42} = {val!r}   @0x{abs_off:X}")
+    if key == "INVENTORYTABLE":
+        for w in ("Poor", "Average", "Wealthy", "Pirate"):
+            total = sum(values.get(f"ClassProbabilityData[{w}].{c}", 0.0) for c in "CBAS")
+            print(f"  sanity: {w} row sums to {total:g} -> {'OK' if abs(total-100) < 0.5 or abs(total-1) < 0.005 else 'MISMATCH (offsets may be stale)'}")
     if key in SANITY:
         fname, expected = SANITY[key]
         got = values.get(fname)
