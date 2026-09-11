@@ -166,7 +166,7 @@ class PeekState(ModState):
     calibration_logging: bool = True
     min_slots: int = MIN_SLOTS_FOR_FREIGHTER
     last_freighter: str = "none seen yet"
-    caller_to_resolve: int = 0
+    caller_to_resolve: str = ""
 
 
 # ============================================================================================
@@ -296,13 +296,13 @@ class FreighterClassPeek(Mod):
         self.reannounce()
 
     @property
-    @INTEGER("Caller address to resolve (NMS+0x..., decimal ok)")
-    def caller_to_resolve(self) -> int:
+    @STRING("Caller address to resolve (paste 0x... from a log line)")
+    def caller_to_resolve(self) -> str:
         return self.state.caller_to_resolve
 
     @caller_to_resolve.setter
-    def caller_to_resolve(self, value: int):
-        self.state.caller_to_resolve = int(value)
+    def caller_to_resolve(self, value: str):
+        self.state.caller_to_resolve = str(value).strip()
 
     @gui_button("Find function start for caller address")
     def find_function_start(self):
@@ -310,9 +310,13 @@ class FreighterClassPeek(Mod):
         enclosing function. MSVC pads between functions with 0xCC bytes and aligns starts to 16 bytes, so the
         first 16-aligned byte after a run of 0xCC below the address is the usual function start. Prints the
         three nearest candidates; the nearest one is right in the large majority of cases."""
-        rel = self.state.caller_to_resolve
+        raw = self.state.caller_to_resolve.replace("NMS+", "").strip()
+        try:
+            rel = int(raw, 0) if raw else 0
+        except ValueError:
+            rel = 0
         if rel <= 0:
-            logger.error("Set 'Caller address to resolve' first (from a 'caller NMS+0x...' log line)")
+            logger.error("Set 'Caller address to resolve' first, e.g. 0x11F7A31 (from a 'caller NMS+0x...' log line)")
             return
         try:
             span = 0x20000
