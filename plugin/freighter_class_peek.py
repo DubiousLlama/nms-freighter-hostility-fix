@@ -432,7 +432,7 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "StoreGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
             detour_time="before",
         )
         def _generator_before(self, this, lpSeed, liArg, lbArg):
@@ -460,7 +460,7 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "StoreGenerateInventory",
             offset=GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),  # registers passed through untouched
             detour_time="after",
         )
         def _generator_after(self, this, lpSeed, liArg, lbArg):
@@ -478,7 +478,7 @@ class FreighterClassPeek(Mod):
         @manual_hook(
             "AIShipComponentGenerateInventory",
             offset=AI_GENERATOR_FUNCTION_OFFSET,
-            func_def=FUNCDEF(restype=None, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64, c_uint64, c_uint64, c_uint64]),
             detour_time="before",
         )
         def _ai_generator_before(self, this, a1, a2, a3):
@@ -494,10 +494,16 @@ class FreighterClassPeek(Mod):
                 extra += f" called from NMS+0x{caller:X}"
             except Exception:
                 pass
-            same_as_store = int(this) in self._known_stores or int(this) in self._pending
+            t = int(this)
+            if self._is_player_store(t):
+                kind = "= PLAYER-STATE store (not the freighter path; ignore unless visor_scan=True)"
+            elif t in self._known_stores or t in self._pending:
+                kind = "= a known NPC STORE, climb one more level"
+            else:
+                kind = "(not a store we know of: component candidate)"
             logger.info(
-                f"upper generator(this=0x{int(this):X}{' = a STORE, climb one more level' if same_as_store else ' (not a known store: component candidate)'}, "
-                f"a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) visor_scan={self._in_visor_scan}{extra}"
+                f"upper generator(this=0x{t:X} {kind}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) "
+                f"visor_scan={self._in_visor_scan}{extra}"
             )
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
