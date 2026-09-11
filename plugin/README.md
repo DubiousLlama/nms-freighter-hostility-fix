@@ -72,6 +72,17 @@ Mechanism (from NMS.py's field map and the 4.13 symbol catalogue in its git hist
 arrays, waits a quarter second for the generator to finish, then reads the store's class, size
 and name. Stores with at least the threshold number of slots are reported as freighter-sized.
 
+Reading the log. Size is width x height (the layout descriptor's `Slots` field reads a constant
+and is shown only as `layoutSlots`). Stores generated within one second of each other are reported
+as a **BURST**: a freighter group spawning at system load produces several stores at once (capital
+ship plus escort freighters), while traders landing at the station produce single small stores every
+few seconds. The largest store in a load-time burst is the capital freighter candidate; the same
+stores may be re-added later with identical values and are marked `(repeat)`.
+
+First validation, once: warp into a system with a freighter, note the BURST line's largest entry,
+then land on the capital freighter and compare the class the captain quotes. If they match, the
+class is fixed at spawn and the peek is trustworthy.
+
 Calibration, once:
 
 1. Leave "Log every caller address" on. Warp into a system where a freighter battle triggers.

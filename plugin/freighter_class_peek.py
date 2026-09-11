@@ -134,17 +134,20 @@ class InventoryEvent:
     caller: int
     width: int
     height: int
-    slots: int
+    cells: int  # width * height; the reliable size measure
+    layout_slots: int  # cGcInventoryLayout.Slots as read; observed constant, kept for diagnostics
     klass: str
     name: str
     source: str  # "GenerateInventory" | "caller-match" | "heuristic"
+    repeat: bool = False  # same store address reported before with the same class
 
-    def line(self) -> str:
+    def line(self, threshold: int = MIN_SLOTS_FOR_FREIGHTER) -> str:
         ts = time.strftime("%H:%M:%S", time.localtime(self.when))
-        tag = "FREIGHTER?" if self.slots >= MIN_SLOTS_FOR_FREIGHTER else "small"
+        tag = "FREIGHTER?" if self.cells >= threshold else "small"
+        rep = " (repeat)" if self.repeat else ""
         return (
-            f"{ts}  class {self.klass:<1}  {self.width}x{self.height} ({self.slots} slots)  "
-            f"[{self.source}] {tag}  caller NMS+0x{self.caller:X}  name={self.name or '-'}"
+            f"{ts}  class {self.klass:<1}  {self.width}x{self.height}={self.cells}  [{self.source}] {tag}{rep}  "
+            f"store 0x{self.store_addr:X}  caller NMS+0x{self.caller:X}  layoutSlots={self.layout_slots}"
         )
 
 
@@ -176,8 +179,11 @@ class FreighterClassPeek(Mod):
         self._generate_component = 0
         self._player_ranges: Optional[list[tuple[int, int]]] = None
         self._notifications_addr = 0
-        self._events: deque[InventoryEvent] = deque(maxlen=12)
+        self._events: deque[InventoryEvent] = deque(maxlen=16)
         self._seen_callers: dict[int, int] = {}
+        self._known_stores: dict[int, str] = {}  # store_addr -> last class reported
+        self._burst: list[InventoryEvent] = []
+        self._burst_t = 0.0
 
     # ---------------------------------------------------------------- GUI
 
@@ -193,7 +199,7 @@ class FreighterClassPeek(Mod):
     @property
     @STRING("Recent NPC inventories", readonly=True, multiline=True, height=220)
     def recent(self) -> str:
-        return "\n".join(e.line() for e in reversed(self._events)) or "(nothing yet)"
+        return "\n".join(e.line(self.state.min_slots) for e in reversed(self._events)) or "(nothing yet)"
 
     @recent.setter
     def recent(self, value: str):
@@ -318,6 +324,8 @@ class FreighterClassPeek(Mod):
 
     @main_loop.after
     def _process_pending(self):
+        if self._burst and time.time() - self._burst_t > 1.0:
+            self._flush_burst()
         if not self._pending:
             return
         now = time.time()
@@ -335,10 +343,11 @@ class FreighterClassPeek(Mod):
     def _inspect_store(self, addr: int, caller: int, in_gen: bool):
         store = map_struct(addr, nms.cGcInventoryStore)
         width, height = int(store.miWidth), int(store.miHeight)
+        cells = max(0, width) * max(0, height)
         try:
-            slots = int(store.mLayoutDescriptor.Slots)
+            layout_slots = int(store.mLayoutDescriptor.Slots)
         except Exception:
-            slots = width * height
+            layout_slots = -1
         klass = self._class_name(store)
         try:
             name = str(store.mInventoryName).strip("\x00")
@@ -350,15 +359,41 @@ class FreighterClassPeek(Mod):
             source = "caller-match"
         else:
             source = "heuristic"
-        ev = InventoryEvent(time.time(), addr, caller, width, height, slots, klass, name, source)
+        repeat = self._known_stores.get(addr) == klass
+        self._known_stores[addr] = klass
+        now = time.time()
+        ev = InventoryEvent(now, addr, caller, width, height, cells, layout_slots, klass, name, source, repeat)
         self._events.append(ev)
         if self.state.calibration_logging:
-            logger.info(ev.line())
-        if slots >= self.state.min_slots or source == "GenerateInventory":
-            summary = f"class {klass}  ({width}x{height}, {slots} slots, {source})"
+            logger.info(ev.line(self.state.min_slots))
+
+        # Group stores generated within the same short window: a freighter fleet spawning produces a
+        # burst of several stores at once (capital ship plus escorts), traders landing produce singles.
+        if now - self._burst_t > 1.0:
+            self._flush_burst()
+        self._burst.append(ev)
+        self._burst_t = now
+
+        if cells >= self.state.min_slots or source == "GenerateInventory":
+            summary = f"class {klass}  ({width}x{height}={cells} cells, {source}{', repeat' if repeat else ''})"
             self.state.last_freighter = summary
-            logger.info(f"FREIGHTER-SIZED INVENTORY GENERATED: {summary}")
-            self._announce(f"Freighter inventory generated: class {klass}")
+            if not repeat:
+                logger.info(f"FREIGHTER-SIZED INVENTORY GENERATED: {summary}")
+                self._announce(f"Freighter inventory generated: class {klass}")
+
+    def _flush_burst(self):
+        if len(self._burst) >= 2:
+            big = [e for e in self._burst if e.cells >= self.state.min_slots]
+            desc = ", ".join(f"{e.klass} {e.width}x{e.height}" for e in self._burst)
+            if big:
+                best = max(big, key=lambda e: e.cells)
+                logger.info(
+                    f"BURST of {len(self._burst)} stores [{desc}] -> largest: class {best.klass} "
+                    f"{best.width}x{best.height} (capital freighter candidate)"
+                )
+            else:
+                logger.info(f"burst of {len(self._burst)} small stores [{desc}]")
+        self._burst = []
 
     # ---------------------------------------------------------------- Helpers
 
