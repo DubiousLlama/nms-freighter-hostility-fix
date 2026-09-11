@@ -83,7 +83,7 @@ KNOWN_GENERATION_CALLERS: set[int] = set()
 # return address into the start of the enclosing function, and put it here (relative to NMS.exe, e.g.
 # 0x11F7610). The mod then hooks that function as cGcAISpaceshipComponent::GenerateInventory(this, seed*,
 # int, bool) and logs the component pointer and arguments every time the game generates an NPC inventory.
-GENERATOR_FUNCTION_OFFSET = 0
+GENERATOR_FUNCTION_OFFSET = 0x4CBC80
 
 # Alternative to typing into the GUI: put the "caller NMS+0x..." value here (e.g. 0x11F7A31), reload, and
 # press "Find function start". The GUI field, if filled, takes precedence.
@@ -94,7 +94,7 @@ CALLER_ADDRESS_TO_RESOLVE = 0
 # GENERATOR_FUNCTION_OFFSET set, the mod logs "store generator called from NMS+0x..."; resolve that
 # address with the finder and put the function start here to hook the component-level generator and
 # log the component pointer (`this`) and the seed it passes.
-AI_GENERATOR_FUNCTION_OFFSET = 0
+AI_GENERATOR_FUNCTION_OFFSET = 0x4CA440
 
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
@@ -103,7 +103,7 @@ MIN_SLOTS_FOR_FREIGHTER = 20
 # calibration). pyMHF implements this by rewriting bytes inside minhook's trampoline for the hooked
 # function; Add is called constantly, so this is the riskiest part of the mod. Off for the first run;
 # turn on once the mod is known to load cleanly.
-USE_GET_CALLER = False
+USE_GET_CALLER = True
 
 # Hook cGcPlayerNotifications::AddTimedMessage so the mod can show HUD messages. NMS.py marks that
 # function's argument list as unconfirmed since 4.13, and a hook re-calls the original with the
