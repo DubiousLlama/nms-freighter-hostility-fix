@@ -23,17 +23,22 @@ Layer 2 needs two byte patterns you must extract from your `NMS.exe`.
   running under into the game:
 
   ```
-  py -3.12 -m pip install --user --upgrade "pymhf[gui]" nmspy prompt_toolkit questionary
-  py -3.12 -m pymhf run C:\path\to\plugin\freighter_class_peek.py
+  py -3.12 -m pip install --upgrade "pymhf[gui]" nmspy prompt_toolkit questionary
+  py -3.12 -c "import pymhf; pymhf.run()" run C:\path\to\plugin\freighter_class_peek.py
   ```
+
+  pyMHF has no `python -m pymhf` entry point (there is no `__main__.py`); its CLI is the `pymhf`
+  console script, which the `-c` form calls directly so PATH order between Python installs does
+  not matter. If `pymhf --version` reports the 3.12 install, plain `pymhf run ...` also works.
+* Not 3.14: pyMHF and NMS.py both list 3.9 to 3.13 only, and NMS.py's README says 3.14 needs a
+  dependency change first.
 
 ## Run
 
 ```
-py -3.12 -m pymhf run path\to\plugin\freighter_class_peek.py
+py -3.12 -c "import pymhf; pymhf.run()" run path\to\plugin\freighter_class_peek.py
 ```
 
-(`pymhf run ...` also works if the `pymhf` script on your PATH belongs to the 3.10+ install.)
 
 pyMHF launches the game (or attaches, per its config), opens a GUI window with a tab for this mod
 and a log window. Alternatively copy the file into `GAMEDATA\MODS\` and run `pymhf run nmspy`,
@@ -112,7 +117,7 @@ folder itself (`log_dir = "."`). Pattern offsets are cached per exe hash in
 
 **`TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` from
 `nmspy\data\basic_types.py`**: you are on Python 3.9. NMS.py needs 3.10 or newer (see Requirements).
-Install 3.12 and run pyMHF with `py -3.12 -m pymhf ...`.
+Install 3.12 and run pyMHF from it (see Requirements for the exact command).
 
 **Safety switches**: `USE_GET_CALLER` and `ENABLE_HUD_ANNOUNCE` at the top of the mod file are off
 by default. The first only matters for caller-address calibration; the second only for the in-game
