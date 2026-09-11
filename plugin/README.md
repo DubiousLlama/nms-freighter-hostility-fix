@@ -92,6 +92,23 @@ Finding the two patterns requires a disassembler. The approach NMS.py's author d
 If you get the patterns, contributing them upstream to NMS.py (`tools/data.json` and
 `nmspy/data/types.py`) helps everyone.
 
+## Troubleshooting
+
+**`AttributeError: 'NoneType' object has no attribute 'isatty'` from `questionary`/`prompt_toolkit`
+during injection, then "pyMHF exiting..."**
+
+pyMHF builds its interactive config prompts at import time (`pymhf/__init__.py`, the
+`questionary.confirm("Start the game paused?")` line). Inside the game process there is no
+console, so `sys.stdout` is `None`. prompt_toolkit versions before **3.0.25** (January 2022,
+commit "Use DummyOutput when sys.stdout is None") crash on that; newer ones fall back to a dummy
+output. The traceback line `if io.isatty():` without a `None` check is the pre-3.0.25 code. Fix:
+
+```
+python -m pip install --user --upgrade prompt_toolkit questionary
+```
+
+then run again. This is independent of the mod and of the `start_paused` setting.
+
 ## Caveats
 
 * Game updates change patterns and offsets. When NMS.py updates, this mod usually follows; when
