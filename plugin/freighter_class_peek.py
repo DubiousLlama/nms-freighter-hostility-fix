@@ -96,6 +96,12 @@ CALLER_ADDRESS_TO_RESOLVE = 0
 # log the component pointer (`this`) and the seed it passes.
 AI_GENERATOR_FUNCTION_OFFSET = 0  # 0x4CA440 crashed (stack args); the stack walk below replaces this hook
 
+# Step 4: the function containing the "called from NMS+0x1703900" return address is the component's lazy
+# inventory getter (it derives the seed from the component and calls the generator). Resolve that address
+# with the finder and put the function start here; the mod logs its arguments and return value on the
+# next scan. This is the function the peek-from-space will call.
+GETTER_FUNCTION_OFFSET = 0
+
 # Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
 MIN_SLOTS_FOR_FREIGHTER = 20
 
@@ -209,6 +215,9 @@ class FreighterClassPeek(Mod):
         self._pending_scan_t = 0.0
         self._last_scan_node = 0
         self._generated_components: deque[tuple[float, int, int, int]] = deque(maxlen=16)  # (t, this, arg, flag)
+        self._freighter_component = 0
+        self._component_vtable = 0
+        self._store_offset_in_component = 0
 
     # ---------------------------------------------------------------- GUI
 
@@ -438,6 +447,11 @@ class FreighterClassPeek(Mod):
         def _generator_before(self, this, lpSeed, liArg, lbArg, *_stack):
             self._in_generate = True
             self._generate_component = int(this)
+            if self._in_visor_scan and self._freighter_component and not self._store_offset_in_component:
+                off = int(this) - self._freighter_component
+                if 0 < off < 0x20000:
+                    self._store_offset_in_component = off
+                    logger.info(f"general store offset inside the component = 0x{off:X}")
             try:
                 caller = self._generator_before.caller_address()
                 logger.info(f"store generator called from NMS+0x{caller:X} (resolve this to hook the component generator)")
@@ -512,6 +526,39 @@ class FreighterClassPeek(Mod):
                 f"upper generator(this=0x{t:X} {kind}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) "
                 f"visor_scan={self._in_visor_scan}{extra}"
             )
+            if self._in_visor_scan and "component" in kind:
+                self._freighter_component = t
+                self._analyse_component(t)
+
+    if GETTER_FUNCTION_OFFSET:
+
+        @manual_hook(
+            "AIShipComponentGetInventory",
+            offset=GETTER_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),
+            detour_time="before",
+        )
+        def _getter_before(self, this, a1, a2, a3, *_stack):
+            logger.info(
+                f"getter(this=0x{int(this):X}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) "
+                f"visor_scan={self._in_visor_scan}"
+            )
+
+        @manual_hook(
+            "AIShipComponentGetInventory",
+            offset=GETTER_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),
+            detour_time="after",
+        )
+        def _getter_after(self, this, a1, a2, a3, *_stack, _result_=None):
+            try:
+                r = int(_result_) if _result_ is not None else 0
+            except Exception:
+                r = 0
+            note = ""
+            if r and (r in self._known_stores or r in self._pending or abs(r - int(this)) < 0x20000):
+                note = " (looks like a store pointer inside the component)"
+            logger.info(f"getter returned 0x{r:X}{note}")
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
 
@@ -622,6 +669,53 @@ class FreighterClassPeek(Mod):
             else:
                 logger.info(f"burst of {len(self._burst)} small stores [{desc}]")
         self._burst = []
+
+    # ---------------------------------------------------------------- Component analysis
+
+    def _analyse_component(self, comp: int):
+        """Log what identifies this component: its vtable (shared by all AI ship components) and the
+        offset of the pointer to its cGcAISpaceshipComponentData (Type at +0x38, Freighter = 4)."""
+        img_lo, img_hi = BASE_ADDRESS, BASE_ADDRESS + SIZE_OF_IMAGE
+        try:
+            vt = int.from_bytes(ctypes.string_at(comp, 8), "little")
+            if img_lo <= vt < img_hi:
+                self._component_vtable = vt
+                logger.info(f"component vtable = NMS+0x{vt - BASE_ADDRESS:X} (identifies cGcAISpaceshipComponent instances)")
+            else:
+                logger.info(f"component first qword 0x{vt:X} is not inside NMS.exe (no vtable at +0)")
+        except Exception as e:
+            logger.error(f"cannot read component: {e}")
+            return
+        import struct as _struct
+        try:
+            head = ctypes.string_at(comp, 0x400)
+        except Exception as e:
+            logger.error(f"cannot read component head: {e}")
+            return
+        found = 0
+        for off in range(0, 0x400 - 8, 8):
+            (p,) = _struct.unpack_from("<Q", head, off)
+            if p < 0x10000 or p > 0x7FFFFFFFFFFF:
+                continue
+            try:
+                blk = ctypes.string_at(p, 0x40)
+            except Exception:
+                continue
+            cls, typ = _struct.unpack_from("<II", blk, 0x34)
+            if typ == 4 and cls == 0:
+                ident = blk[0x20:0x30].split(b"\x00")[0]
+                try:
+                    ident_s = ident.decode("ascii")
+                except Exception:
+                    ident_s = ident.hex()
+                logger.info(
+                    f"component data pointer candidate at component+0x{off:X} -> 0x{p:X}: Type=4 (Freighter), "
+                    f"Class=0, CombatDefinitionID='{ident_s}'"
+                )
+                found += 1
+        if not found:
+            logger.info("no cGcAISpaceshipComponentData pointer found in the first 0x400 bytes with Type=4/Class=0; "
+                        "will try a wider window next time")
 
     # ---------------------------------------------------------------- Stack walk
 
