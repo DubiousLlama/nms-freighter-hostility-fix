@@ -51,7 +51,7 @@ from typing import Annotated, Optional
 
 from pymhf import Mod, ModState
 from pymhf import FUNCDEF
-from pymhf.core._internal import BASE_ADDRESS
+from pymhf.core._internal import BASE_ADDRESS, SIZE_OF_IMAGE
 from pymhf.core.hooking import Structure, function_hook, get_caller, manual_hook, on_key_pressed
 from pymhf.core.memutils import get_addressof, map_struct
 from pymhf.gui.decorators import BOOLEAN, INTEGER, STRING, gui_button
@@ -321,6 +321,14 @@ class FreighterClassPeek(Mod):
             rel = int(CALLER_ADDRESS_TO_RESOLVE)
         if rel <= 0:
             logger.error("Set 'Caller address to resolve' first, e.g. 0x11F7A31 (from a 'caller NMS+0x...' log line)")
+            return
+        if rel >= SIZE_OF_IMAGE:
+            logger.error(
+                f"0x{rel:X} is larger than NMS.exe itself (0x{SIZE_OF_IMAGE:X} bytes): that is an absolute heap "
+                "address such as a 'store 0x...' value, not a 'caller NMS+0x...' offset. Use the caller value. "
+                "If every caller reads NMS+0x0, set USE_GET_CALLER = True and reload; the log must then show "
+                "'has a modified hook to get the calling address'."
+            )
             return
         try:
             span = 0x20000
