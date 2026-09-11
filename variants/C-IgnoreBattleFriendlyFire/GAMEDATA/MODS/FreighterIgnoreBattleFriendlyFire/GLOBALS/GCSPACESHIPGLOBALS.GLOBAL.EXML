@@ -3,11 +3,12 @@
   FreighterIgnoreBattleFriendlyFire (variant C, EXPERIMENTAL)
   Partial patch for GLOBALS/GCSPACESHIPGLOBALS.GLOBAL.MBIN (No Man's Sky 7.x, Cosmos).
 
-  FreighterBattleIgnoreFriendlyFireDistance is Hello Games' own friendly-fire leniency for
-  freighter battles (community-reported default: 7200 in 3.x/4.x, 10000 in later versions).
-  The direction of the check (ignore friendly fire INSIDE this distance, or OUTSIDE it) is not
-  documented anywhere public, so this variant may help or may do nothing. If it makes things
-  worse, try 0.000000 instead. Combine with variant A if you want belt and braces.
+  FreighterBattleIgnoreFriendlyFireDistance dates to Beyond (2.0). The Beyond patch notes say
+  trader ships in a freighter battle "do not report friendly fire as a crime unless the shot is
+  fatal"; this field is most likely the radius around the battle inside which that leniency
+  applies. It is in the player-ship globals, not the freighter AI globals, so it probably has
+  no effect on the freighter's own hostility or hangar. Kept only as a cheap experiment.
+  Community defaults: 7200 (3.x) / 10000 (later). If it makes things worse, remove it.
 -->
 <Data template="cGcSpaceshipGlobals">
 	<Property name="FreighterBattleIgnoreFriendlyFireDistance" value="1000000.000000" />

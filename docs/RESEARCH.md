@@ -45,7 +45,7 @@ environment). Treat the "Unknowns" section as the test plan.
 
 | Field | Type | Offset | What we know |
 |---|---|---|---|
-| `FreighterBattleIgnoreFriendlyFireDistance` | float | 0x14C4 | Hypn0tick's Modular Flight Framework: "the range at which freighters will ignore friendly fire", game default 7200 (older) / 10000 (newer). Whether the check is "inside" or "outside" that range is not documented. |
+| `FreighterBattleIgnoreFriendlyFireDistance` | float | 0x14C4 | See the dedicated section below. Best-supported reading: the radius around a freighter battle inside which the player's friendly fire on the *escort trader ships* is not reported as a crime. It is in the player-ship globals, not the AI globals, and there is no evidence it feeds the freighter's own alert counter. Community defaults: 7200 (3.x era) / 10000 (later). |
 
 ### `GLOBALS/GCGAMEPLAYGLOBALS.GLOBAL.MBIN` (`cGcGameplayGlobals`)
 
@@ -53,6 +53,46 @@ environment). Treat the "Unknowns" section as the test plan.
 |---|---|---|---|
 | `FreighterCargoPodHealthFraction` | float | 0x15E4 | Default 0.8 (Xen0nex scripts). Cargo pods are not one-shot, which is consistent with the user's report that mere *hits* (not destruction) already cause hostility. |
 | `FreighterBattleRadius` | float | 0x15E0 | Default 5000. |
+
+## `FreighterBattleIgnoreFriendlyFireDistance`: what it most likely does
+
+Evidence gathered from libMBIN's git history and Hello Games' patch notes:
+
+1. **It is a player-ship global, not an AI global.** It lives in `GcSpaceshipGlobals`
+   (`GCSPACESHIPGLOBALS.GLOBAL.MBIN`), the struct that holds the player's flight model,
+   docking, cockpit and multiplayer distances. Every freighter-hostility knob
+   (`FreighterAlertThreshold`, `FreighterAttackAlertThreshold`, `FreighterAlertTimeOut*`,
+   `FreighterRegisterHitCooldown`, `FreighterIgnorePlayer`, `TraderIgnoreHits`) lives in
+   `GcAISpaceshipGlobals` instead.
+2. **Its struct slot dates to Beyond (2.0, August 2019).** In libMBIN's Beyond-era dump
+   (commit `9921e1c6`, 2019-08-22) the slot at 0x104 already exists as `Unknown0x104`, right
+   after `DistanceFromShipToAllowSpawningOnFreighter` and before the `AltControls` bools. The
+   NEXT-era layout (commit `5089756a`, 2018-11) has an unrelated field there. libMBIN only
+   learned the name in its 2.43 re-dump (commit `4f10ebfc`, 2020-06-08); the 2.41-2.43
+   hotfix notes contain nothing about freighters, so the name is not tied to those patches.
+3. **Beyond's patch notes describe exactly one freighter-battle friendly-fire change:**
+   "The tolerance of trader ships participating in a freighter battle was increased so that
+   they do not report friendly fire as a crime unless the shot is fatal." That sentence has
+   all three parts of the field name: *freighter battle*, *ignore friendly fire*, and an
+   implicit *distance* (what counts as "participating in" the battle).
+4. **The default value fits a participation radius.** 7200 is larger than
+   `FreighterBattleRadius` (5000); the later 10000 equals `SpaceBattleAnyHostileShipsRadius`.
+   A radius of "how close to the battle you must be for your stray shots to be excused" is
+   the natural thing to keep in step with those constants.
+
+Conclusion (not verified in-game, but the only reading consistent with all four points): while a
+freighter battle is active, the player's hits on the friendly *trader/escort ships* within this
+distance of the battle are not reported to the crime/wanted system unless the hit is fatal. The
+"unless fatal" part is code, not data. Nothing links this field to the freighter's own alert
+accumulator, which is what closes the hangar. Raising it therefore should not fix the hangar
+problem; setting it to 0 would make stray hits on escorts count as crimes again. Variant C stays
+in the repo only as a cheap experiment because the reading is inferred rather than observed.
+
+Side note for the "destruction only" goal: Hello Games implemented that exact rule for the
+escort traders in Beyond ("unless the shot is fatal"). The freighter itself never received an
+equivalent; it uses the alert counter with, since 4.40, a per-hit cooldown
+(`FreighterRegisterHitCooldown`, added in the same commit as the alert lights and the
+Echoes freighter-battle rework).
 
 ### Per-entity destructible data (`cGcDestructableComponentData`)
 
@@ -95,7 +135,7 @@ closest data-only approximation.
 2. With A installed, deliberately destroy one cargo pod. If the freighter goes hostile, the
    "destroy" path is separate from the alert accumulator and the mod matches the requested
    behaviour exactly. If it does not, A has removed all player-caused hostility (superset).
-3. Variant C: test both `1000000` and `0`; keep whichever reduces hostility, or drop it.
+3. Variant C: expected to change only crime reporting for hits on escort traders, not freighter hostility. Test it last, at `1000000` and `0`.
 4. Run `tools/read_globals.py` on the extracted globals to record the vanilla values; then
    tune B's `FreighterAlertTimeOutMinTime` if you want a longer grace period.
 

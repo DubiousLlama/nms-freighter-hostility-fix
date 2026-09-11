@@ -34,7 +34,7 @@ To uninstall, delete the folder.
 |---|---|---|
 | `GAMEDATA/MODS/FreighterFriendlyFireTolerance` (**A**, default) | `FreighterAttackAlertThreshold` → 1e9 | First thing to try. Hits can never escalate to hostility. |
 | `variants/B-AutoForgive` | `FreighterAlertTimeOutMinTime` → 3 s, `FreighterAlertTimeOutRate` → 1e6 | Keeps hostility for a sustained deliberate attack, but the freighter forgives you a few seconds after the last hit, so the hangar is open by the time the captain hails you. Closest data-only version of "clear hostility at the reward call". Can be installed alongside A. |
-| `variants/C-IgnoreBattleFriendlyFire` | `FreighterBattleIgnoreFriendlyFireDistance` → 1e6 (in `GCSPACESHIPGLOBALS`) | Experimental. This is Hello Games' own friendly-fire leniency for battles, but the direction of the distance check is undocumented. Try 1e6, then 0. |
+| `variants/C-IgnoreBattleFriendlyFire` | `FreighterBattleIgnoreFriendlyFireDistance` → 1e6 (in `GCSPACESHIPGLOBALS`) | Low expectations. Research (see docs/RESEARCH.md) indicates this is the radius inside which your hits on the *escort trader ships* are excused as crimes during a battle, not a freighter-hostility knob. Kept as a cheap experiment. |
 | `variants/D-IgnorePlayer` | `FreighterIgnorePlayer` → true | Sledgehammer: freighter AI ignores the player completely, including deliberate pod farming. Only if A and B both fail. |
 
 Install a variant exactly like A: copy the folder under `GAMEDATA/MODS/` inside the variant
@@ -86,7 +86,7 @@ python3 tools/read_globals.py "path/to/GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN"
    pirates. Expect the hangar to stay open and the reward hail to arrive.
 2. Same, but destroy one cargo pod on purpose. Note whether the freighter goes hostile; this
    tells you which of the two cases above you are in.
-3. If A changed nothing, add B; if still nothing, try C (both values), then D.
+3. If A changed nothing, add B; if still nothing, try D. C is unlikely to matter; test it last.
 
 Please report which variant worked so the default can be corrected.
 
