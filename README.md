@@ -139,6 +139,12 @@ python3 tools/read_globals.py "path/to/GLOBALS/GCAISPACESHIPGLOBALS.GLOBAL.MBIN"
 
 Please report which variant worked so the default can be corrected.
 
+## Companion code plugin: see the class before landing
+
+`plugin/freighter_class_peek.py` is a pyMHF/NMS.py mod that reports an NPC freighter's class the
+moment the game rolls it, by hooking the inventory generation path. It is a separate, code-level
+tool with its own requirements and caveats; see `plugin/README.md`.
+
 ## Compatibility
 
 * Game: 7.0/7.01 Cosmos. Field names verified against libMBIN 7.02.0.1 (2026-09-11).

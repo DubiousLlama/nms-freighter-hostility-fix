@@ -155,6 +155,34 @@ Practical consequence: the only data-driven separation between "stray" and "deli
 intensity, which is what variants E and F exploit (`tools/make_variant.py`). F scales both
 thresholds; E scales decay. Both are relative to vanilla values that are not published.
 
+## Code plugin research (plugin/freighter_class_peek.py)
+
+Sources: NMS.py commit `bcb0eaa` (2023-08-13) preserved a 22,079-name function catalogue with
+4.13 offsets (`nmspy/data/func_offsets.py`) and ctypes call signatures (`func_sigs.py`); current
+NMS.py (`170671.6`, 2026-09-08) gives `cGcInventoryStore.mClass` at 0x100 and a working
+byte pattern for `cGcInventoryStore::Add`.
+
+Relevant functions (4.13 offsets, for structural matching only):
+
+| Function | 4.13 offset | Signature |
+|---|---|---|
+| `cGcAISpaceshipComponent::GenerateInventory` | 0x11F7610 | `(this, cTkSeed*, int, bool) -> void` |
+| `cGcAISpaceshipComponent::GetClass` | 0x478B60 | `(this) -> int` |
+| `cGcAISpaceshipComponent::GetInventoryStore` | 0x11F74C0 | `(this, ?, int) -> cGcInventoryStore*` |
+| `cGcAISpaceshipComponent::GetResourceSeed` | 0x1055510 | `(this, cTkSeed* out) -> cTkSeed*` |
+| `cGcInventoryStore::GenerateProceduralClass` | 0x3334B0 | `(this, cTkSeed*) -> void` |
+| `cGcInventoryStore::GetClass` | 0x34FDD0 | `(this) -> int` |
+| `cGcAISpaceshipManager::SpawnShip` (3 overloads) | 0x11FF660 / 0x1202500 / 0x12029E0 | see catalogue |
+| `cGcInteractionComponent::IsFreighterCaptainNPCInteraction` | 0xC5D7E0 | `(this) -> bool` |
+| `cGcPlayerNotifications::AddTimedMessage` | 0x6F05B0 | hooked in current NMS.py (args flagged unconfirmed) |
+
+Design consequence: the class is a field of the NPC ship's `cGcInventoryStore`, written by
+`GenerateProceduralClass` inside `GenerateInventory`, and items are inserted through `Add`. The
+plugin hooks `Add` (known pattern) and reads `mClass` after the store settles; the two generation
+functions are optional refinements whose current-build patterns must be extracted by the user.
+Open question the plugin's log will answer: whether `GenerateInventory` runs at freighter spawn
+(peek is useful) or at hangar entry (nothing can show it earlier).
+
 ## Unknowns to settle in-game (test plan)
 
 0. Variant A has been confirmed working in-game by the author (hangar stays open after stray hits).

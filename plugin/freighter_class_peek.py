@@ -1,0 +1,406 @@
+# /// script
+# dependencies = ["pymhf[gui]>=0.2.3", "nmspy>=170671.6"]
+#
+# [tool.pymhf]
+# exe = "NMS.exe"
+# steam_gameid = 275850
+# start_paused = false
+#
+# [tool.pymhf.gui]
+# always_on_top = true
+#
+# [tool.pymhf.logging]
+# log_dir = "."
+# log_level = "info"
+# window_name_override = "Freighter Class Peek"
+# ///
+"""
+Freighter Class Peek: shows the class (C/B/A/S) of NPC freighters the moment the game generates
+their inventory, so you do not have to land to find out.
+
+How it works
+------------
+Every procedurally generated inventory in No Man's Sky ends up in a `cGcInventoryStore`, whose
+`mClass` field (offset 0x100 in the current build, per NMS.py) holds the rolled class. Items are
+inserted through `cGcInventoryStore::Add`, which NMS.py already hooks with a working byte pattern
+for the current build. This mod therefore:
+
+  Layer 1 (works out of the box, no reverse engineering):
+    hooks `cGcInventoryStore::Add`, ignores the player's own stores, and reports every other
+    store that receives items, with its dimensions, slot count, class and the address of the
+    code that called `Add`. Freighter-sized stores are highlighted. Calibration mode lets you
+    learn which caller address corresponds to NPC-ship inventory generation so later events are
+    tagged with confidence.
+
+  Layer 2 (optional, needs two byte patterns for the current NMS.exe):
+    hooks `cGcAISpaceshipComponent::GenerateInventory` (the function that builds an NPC ship's
+    purchasable inventory) and `cGcInventoryStore::GenerateProceduralClass` (the class roll
+    itself). With these the attribution is exact instead of heuristic. See README.md for how to
+    obtain the patterns; leave the strings empty to run Layer 1 only.
+
+Function names and call signatures come from the 4.13-era symbol catalogue preserved in NMS.py's
+git history (tools/data.json ancestors); `mClass` and the `Add` pattern come from current NMS.py.
+"""
+import ctypes
+import logging
+import time
+from collections import deque
+from ctypes import _Pointer, c_bool, c_float, c_int, c_uint32, c_uint64
+from dataclasses import dataclass
+from typing import Annotated, Optional
+
+from pymhf import Mod, ModState
+from pymhf.core.hooking import Structure, function_hook, get_caller, on_key_pressed
+from pymhf.core.memutils import get_addressof, map_struct
+from pymhf.gui.decorators import BOOLEAN, INTEGER, STRING, gui_button
+
+import nmspy.data.basic_types as basic
+import nmspy.data.exported_types as nmse
+import nmspy.data.types as nms
+from nmspy.common import gameData
+from nmspy.data.enums import cGcInventoryClass
+from nmspy.decorators import main_loop
+
+logger = logging.getLogger("FreighterClassPeek")
+
+# ============================================================================================
+# Configuration
+# ============================================================================================
+
+# Layer 2 byte patterns for the CURRENT NMS.exe. Leave empty to use Layer 1 only.
+# Format is the pyMHF/IDA style: "48 89 5C 24 ? 57 48 83 EC ? ..."
+SIG_GENERATE_INVENTORY = ""  # cGcAISpaceshipComponent::GenerateInventory(this, cTkSeed*, int, bool)
+SIG_GENERATE_PROCEDURAL_CLASS = ""  # cGcInventoryStore::GenerateProceduralClass(this, cTkSeed*)
+
+# Layer 1 calibration: relative addresses (NMS.exe+X) of the code that calls cGcInventoryStore::Add
+# while an NPC ship inventory is generated. Fill from the calibration log (see README). Optional.
+KNOWN_GENERATION_CALLERS: set[int] = set()
+
+# Layer 1 heuristic: stores at least this many slots big are labelled "freighter-sized".
+MIN_SLOTS_FOR_FREIGHTER = 20
+
+# Delay before a newly touched store is inspected, so the generator has finished writing it.
+SETTLE_SECONDS = 0.25
+
+# ============================================================================================
+# Optional Layer 2 hook definitions (only created when patterns are supplied)
+# ============================================================================================
+
+if SIG_GENERATE_INVENTORY:
+
+    class cGcAISpaceshipComponent(Structure):
+        @function_hook(SIG_GENERATE_INVENTORY)
+        def GenerateInventory(
+            self,
+            this: "_Pointer[cGcAISpaceshipComponent]",
+            lpSeed: c_uint64,  # cTkSeed *
+            liArg: c_int,
+            lbArg: Annotated[bool, c_bool],
+        ): ...
+
+
+if SIG_GENERATE_PROCEDURAL_CLASS:
+
+    class cGcInventoryStoreGen(Structure):
+        @function_hook(SIG_GENERATE_PROCEDURAL_CLASS)
+        def GenerateProceduralClass(
+            self,
+            this: "_Pointer[nms.cGcInventoryStore]",
+            lpSeed: c_uint64,  # cTkSeed *
+        ): ...
+
+
+# ============================================================================================
+# Data
+# ============================================================================================
+
+
+@dataclass
+class InventoryEvent:
+    when: float
+    store_addr: int
+    caller: int
+    width: int
+    height: int
+    slots: int
+    klass: str
+    name: str
+    source: str  # "GenerateInventory" | "caller-match" | "heuristic"
+
+    def line(self) -> str:
+        ts = time.strftime("%H:%M:%S", time.localtime(self.when))
+        tag = "FREIGHTER?" if self.slots >= MIN_SLOTS_FOR_FREIGHTER else "small"
+        return (
+            f"{ts}  class {self.klass:<1}  {self.width}x{self.height} ({self.slots} slots)  "
+            f"[{self.source}] {tag}  caller NMS+0x{self.caller:X}  name={self.name or '-'}"
+        )
+
+
+@dataclass
+class PeekState(ModState):
+    announce_in_game: bool = False
+    calibration_logging: bool = True
+    min_slots: int = MIN_SLOTS_FOR_FREIGHTER
+    last_freighter: str = "none seen yet"
+
+
+# ============================================================================================
+# Mod
+# ============================================================================================
+
+
+class FreighterClassPeek(Mod):
+    __author__ = "DubiousLlama"
+    __description__ = "Show NPC freighter class as soon as it is generated (no landing needed)"
+    __version__ = "0.1"
+
+    state = PeekState()
+
+    def __init__(self):
+        super().__init__()
+        self._pending: dict[int, tuple[float, int, bool]] = {}  # store_addr -> (t, caller, in_generate)
+        self._reported: dict[int, float] = {}  # store_addr -> last report time (debounce)
+        self._in_generate = False
+        self._generate_component = 0
+        self._player_ranges: Optional[list[tuple[int, int]]] = None
+        self._notifications_addr = 0
+        self._events: deque[InventoryEvent] = deque(maxlen=12)
+        self._seen_callers: dict[int, int] = {}
+
+    # ---------------------------------------------------------------- GUI
+
+    @property
+    @STRING("Last freighter-sized inventory", readonly=True)
+    def last_freighter(self) -> str:
+        return self.state.last_freighter
+
+    @last_freighter.setter
+    def last_freighter(self, value: str):
+        pass
+
+    @property
+    @STRING("Recent NPC inventories", readonly=True, multiline=True, height=220)
+    def recent(self) -> str:
+        return "\n".join(e.line() for e in reversed(self._events)) or "(nothing yet)"
+
+    @recent.setter
+    def recent(self, value: str):
+        pass
+
+    @property
+    @INTEGER("Freighter-sized threshold (slots)")
+    def min_slots(self) -> int:
+        return self.state.min_slots
+
+    @min_slots.setter
+    def min_slots(self, value: int):
+        self.state.min_slots = max(1, int(value))
+
+    @property
+    @BOOLEAN("Log every caller address (calibration)")
+    def calibration_logging(self) -> bool:
+        return self.state.calibration_logging
+
+    @calibration_logging.setter
+    def calibration_logging(self, value: bool):
+        self.state.calibration_logging = value
+
+    @property
+    @BOOLEAN("Announce in-game (experimental, may crash)")
+    def announce_in_game(self) -> bool:
+        return self.state.announce_in_game
+
+    @announce_in_game.setter
+    def announce_in_game(self, value: bool):
+        self.state.announce_in_game = value
+
+    @gui_button("Re-announce last freighter")
+    def reannounce(self):
+        logger.info(f"Last freighter-sized inventory: {self.state.last_freighter}")
+        self._announce(self.state.last_freighter)
+
+    @gui_button("Dump caller statistics to log")
+    def dump_callers(self):
+        for caller, n in sorted(self._seen_callers.items(), key=lambda kv: -kv[1]):
+            logger.info(f"caller NMS+0x{caller:X}: {n} Add() calls")
+
+    @on_key_pressed("k")
+    def key_reannounce(self):
+        self.reannounce()
+
+    # ---------------------------------------------------------------- Hooks: Layer 1
+
+    @get_caller
+    @nms.cGcInventoryStore.Add.after
+    def _after_add(
+        self,
+        this: _Pointer[nms.cGcInventoryStore],
+        result: _Pointer[nmse.cGcInventoryIndex],
+        lItem: _Pointer[nmse.cGcInventoryElement],
+    ):
+        try:
+            addr = get_addressof(this)
+            caller = self._after_add.caller_address()
+        except Exception:  # never let a detour raise into the game
+            return
+        if self._is_player_store(addr):
+            return
+        self._seen_callers[caller] = self._seen_callers.get(caller, 0) + 1
+        # Keep the earliest caller seen for this store during the current burst of Add() calls.
+        if addr not in self._pending:
+            self._pending[addr] = (time.time(), caller, self._in_generate)
+        else:
+            t0, c0, g0 = self._pending[addr]
+            self._pending[addr] = (time.time(), c0, g0 or self._in_generate)
+
+    @nms.cGcPlayerNotifications.AddTimedMessage.after
+    def _capture_notifications(self, this, *args):
+        # Grab the cGcPlayerNotifications instance the first time the game shows any timed message.
+        if not self._notifications_addr:
+            try:
+                self._notifications_addr = get_addressof(this)
+                logger.info(f"Captured cGcPlayerNotifications at 0x{self._notifications_addr:X}")
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
+
+    if SIG_GENERATE_INVENTORY:
+
+        @cGcAISpaceshipComponent.GenerateInventory.before
+        def _gen_before(self, this, lpSeed, liArg, lbArg):
+            self._in_generate = True
+            self._generate_component = get_addressof(this)
+            logger.info(
+                f"cGcAISpaceshipComponent::GenerateInventory(component=0x{self._generate_component:X}, "
+                f"arg={liArg}, flag={lbArg})"
+            )
+
+        @cGcAISpaceshipComponent.GenerateInventory.after
+        def _gen_after(self, this, lpSeed, liArg, lbArg):
+            self._in_generate = False
+
+    if SIG_GENERATE_PROCEDURAL_CLASS:
+
+        @cGcInventoryStoreGen.GenerateProceduralClass.after
+        def _class_after(self, this, lpSeed):
+            try:
+                store = this.contents
+                logger.info(
+                    f"GenerateProceduralClass -> {self._class_name(store)} for store 0x{get_addressof(this):X} "
+                    f"(inside GenerateInventory={self._in_generate})"
+                )
+                addr = get_addressof(this)
+                if addr not in self._pending:
+                    self._pending[addr] = (time.time(), 0, self._in_generate)
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- Per-frame processing
+
+    @main_loop.after
+    def _process_pending(self):
+        if not self._pending:
+            return
+        now = time.time()
+        done = [a for a, (t, _, _) in self._pending.items() if now - t >= SETTLE_SECONDS]
+        for addr in done:
+            t, caller, in_gen = self._pending.pop(addr)
+            if now - self._reported.get(addr, 0) < 2.0:
+                continue  # same store reported moments ago
+            self._reported[addr] = now
+            try:
+                self._inspect_store(addr, caller, in_gen)
+            except Exception as e:
+                logger.debug(f"inspect failed for 0x{addr:X}: {e}")
+
+    def _inspect_store(self, addr: int, caller: int, in_gen: bool):
+        store = map_struct(addr, nms.cGcInventoryStore)
+        width, height = int(store.miWidth), int(store.miHeight)
+        try:
+            slots = int(store.mLayoutDescriptor.Slots)
+        except Exception:
+            slots = width * height
+        klass = self._class_name(store)
+        try:
+            name = str(store.mInventoryName).strip("\x00")
+        except Exception:
+            name = ""
+        if in_gen:
+            source = "GenerateInventory"
+        elif caller in KNOWN_GENERATION_CALLERS:
+            source = "caller-match"
+        else:
+            source = "heuristic"
+        ev = InventoryEvent(time.time(), addr, caller, width, height, slots, klass, name, source)
+        self._events.append(ev)
+        if self.state.calibration_logging:
+            logger.info(ev.line())
+        if slots >= self.state.min_slots or source == "GenerateInventory":
+            summary = f"class {klass}  ({width}x{height}, {slots} slots, {source})"
+            self.state.last_freighter = summary
+            logger.info(f"FREIGHTER-SIZED INVENTORY GENERATED: {summary}")
+            self._announce(f"Freighter inventory generated: class {klass}")
+
+    # ---------------------------------------------------------------- Helpers
+
+    @staticmethod
+    def _class_name(store) -> str:
+        try:
+            k = store.mClass
+            if hasattr(k, "name"):
+                return k.name
+            return cGcInventoryClass(int(k)).name
+        except Exception:
+            return "?"
+
+    def _is_player_store(self, addr: int) -> bool:
+        if self._player_ranges is None:
+            ps = gameData.player_state
+            if ps is None:
+                return False
+            ranges = []
+            for attr in (
+                "mInventories",
+                "mVehicleInventories",
+                "mVehicleTechInventories",
+                "mShipInventories",
+                "mShipInventoriesCargo",
+                "mShipInventoriesTechOnly",
+            ):
+                try:
+                    arr = getattr(ps, attr)
+                    base = get_addressof(arr)
+                    ranges.append((base, base + ctypes.sizeof(arr)))
+                except Exception:
+                    continue
+            if not ranges:
+                return False
+            self._player_ranges = ranges
+            logger.info("Player inventory address ranges cached: " + ", ".join(f"0x{a:X}-0x{b:X}" for a, b in ranges))
+        return any(lo <= addr < hi for lo, hi in self._player_ranges)
+
+    def _announce(self, text: str):
+        """Show a timed HUD message. Off by default: the AddTimedMessage argument list in NMS.py is
+        annotated as unconfirmed since 4.13, so a wrong call can crash the game."""
+        if not self.state.announce_in_game or not self._notifications_addr:
+            return
+        try:
+            notif = map_struct(self._notifications_addr, nms.cGcPlayerNotifications)
+            msg = basic.cTkFixedString[512](text)
+            colour = basic.Colour(1.0, 1.0, 1.0, 1.0)
+            icon = nms.cTkSmartResHandle()
+            icon.miInternalHandle = -1
+            notif.AddTimedMessage(
+                lsMessage=ctypes.byref(msg),
+                lfDisplayTime=6.0,
+                lColour=ctypes.byref(colour),
+                liAudioID=0,
+                lIcon=ctypes.byref(icon),
+                unknown=0,
+                unknown2=0,
+                lbShowMessageBackground=True,
+                lbShowIconGlow=False,
+            )
+        except Exception as e:
+            logger.error(f"In-game announce failed (disable the toggle if this repeats): {e}")
