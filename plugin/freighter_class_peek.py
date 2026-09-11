@@ -474,6 +474,7 @@ class FreighterClassPeek(Mod):
 
     if AI_GENERATOR_FUNCTION_OFFSET:
 
+        @get_caller
         @manual_hook(
             "AIShipComponentGenerateInventory",
             offset=AI_GENERATOR_FUNCTION_OFFSET,
@@ -488,9 +489,15 @@ class FreighterClassPeek(Mod):
                     extra = " a1 bytes=" + ctypes.string_at(int(a1), 16).hex(" ").upper()
             except Exception:
                 pass
+            try:
+                caller = self._ai_generator_before.caller_address()
+                extra += f" called from NMS+0x{caller:X}"
+            except Exception:
+                pass
+            same_as_store = int(this) in self._known_stores or int(this) in self._pending
             logger.info(
-                f"component generator(this=0x{int(this):X}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) "
-                f"visor_scan={self._in_visor_scan}{extra}"
+                f"upper generator(this=0x{int(this):X}{' = a STORE, climb one more level' if same_as_store else ' (not a known store: component candidate)'}, "
+                f"a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) visor_scan={self._in_visor_scan}{extra}"
             )
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
