@@ -131,6 +131,10 @@ COMPONENT_STORE_OFFSET = 0x7D40  # general cGcInventoryStore embedded in the com
 COMPONENT_TECH_STORE_OFFSET = 0x7F88  # technology store, for reference only
 AI_SHIP_TYPE_FREIGHTER = 4  # GcAISpaceshipTypes: None, Pirate, Police, Trader, Freighter, PlayerSquadron, ...
 COMPONENT_SNAPSHOT_SIZE = 0x8A60  # observed pool stride between components; bytes diffed around a natural getter call
+# Offset of the ship's scene-node handle inside the component, once found (the natural-scan hook searches the
+# component for the visor's target handle and logs candidate offsets). 0 = unknown. With it set, the peek
+# skips components whose handle is 0 (pool slots that are not live ships) and prints the handle per ship.
+COMPONENT_NODE_HANDLE_OFFSET = 0
 
 # Register arguments seen on the getter during a natural scan: getter(this=component, a1, a2, a3). The mod
 # records the live values the first time a visor scan runs in a session and replays those. Before that it
@@ -260,6 +264,7 @@ class FreighterClassPeek(Mod):
         self._peek_running = False
         self._component_region: Optional[tuple[int, int]] = None  # (base, size) of the region holding components
         self._component_snapshot: Optional[tuple[int, Optional[bytes]]] = None  # (component, bytes before the getter)
+        self._last_seed_bytes: bytes = b""  # seed passed to the store generator on its last call
 
     # ---------------------------------------------------------------- GUI
 
@@ -539,7 +544,8 @@ class FreighterClassPeek(Mod):
             seed_txt = ""
             try:
                 if int(lpSeed) > 0x10000:
-                    seed_txt = " seed bytes=" + ctypes.string_at(int(lpSeed), 16).hex(" ").upper()
+                    self._last_seed_bytes = ctypes.string_at(int(lpSeed), 16)
+                    seed_txt = " seed bytes=" + self._last_seed_bytes.hex(" ").upper()
             except Exception:
                 pass
             logger.info(
@@ -628,6 +634,20 @@ class FreighterClassPeek(Mod):
                     if pre:
                         logger.info(f"getter pre-state: store {self._store_desc(pre)} hangar='{pre['hangar']}'")
                     self._component_snapshot = (int(this), self._read(int(this), COMPONENT_SNAPSHOT_SIZE))
+                    snap = self._component_snapshot[1]
+                    if snap and self._last_scan_node:
+                        import struct as _struct
+                        offs = []
+                        for delta in (0, 1, -1):
+                            pat = _struct.pack("<I", (self._last_scan_node + delta) & 0xFFFFFFFF)
+                            i = snap.find(pat)
+                            while i != -1:
+                                if i % 4 == 0:
+                                    offs.append(f"+0x{i:X}(handle{delta:+d})" if delta else f"+0x{i:X}")
+                                i = snap.find(pat, i + 1)
+                        logger.info(f"node handle {self._last_scan_node} found in the component at: "
+                                    f"{', '.join(offs) if offs else 'nowhere (stored differently)'}; "
+                                    "put a plain '+0x...' offset into COMPONENT_NODE_HANDLE_OFFSET")
                 except Exception as e:
                     logger.debug(f"pre-state read failed: {e}")
 
@@ -931,8 +951,15 @@ class FreighterClassPeek(Mod):
             raw = self._read(h_ptr, h_len)
             if raw:
                 hangar = raw.split(b"\x00")[0].decode("ascii", errors="replace")
+        (res_handle,) = _struct.unpack_from("<i", blk, 0x18)
+        node = -1
+        if COMPONENT_NODE_HANDLE_OFFSET:
+            nb = self._read(comp + COMPONENT_NODE_HANDLE_OFFSET, 4)
+            if nb:
+                (node,) = _struct.unpack_from("<I", nb, 0)
         return {"comp": comp, "data": data_ptr, "type": typ, "class_data": cls, "w": w, "h": h, "items": items,
-                "klass": klass, "hangar": hangar}
+                "klass": klass, "hangar": hangar, "res_handle": res_handle, "node": node,
+                "hangar_raw": blk[:0x20].hex(), "store_raw": sblk[0x88:0x98].hex()}
 
     @staticmethod
     def _store_desc(c: dict) -> str:
@@ -940,8 +967,9 @@ class FreighterClassPeek(Mod):
             k = cGcInventoryClass(c["klass"]).name
         except Exception:
             k = f"?{c['klass']}"
-        cap = " CAPITAL(hangar)" if c.get("hangar") else ""
-        return f"class {k} {c['w']}x{c['h']} items={c['items']}{cap}"
+        cap = " hangar" if c.get("hangar") or c.get("res_handle", 0) not in (0, -1) else ""
+        node = f" node={c['node']}" if c.get("node", -1) >= 0 else ""
+        return f"class {k} {c['w']}x{c['h']} items={c['items']}{cap}{node}"
 
     def _peek_scan(self, full: bool):
         try:
@@ -1004,11 +1032,20 @@ class FreighterClassPeek(Mod):
             self._peek_lines.append(f"{time.strftime('%H:%M:%S')}  no freighter components in memory")
             return
         queued = 0
-        freighters.sort(key=lambda c: 0 if c["hangar"] else 1)  # capital ship first
+        groups: dict[int, int] = {}
         for c in freighters:
-            logger.info(f"peek: freighter comp 0x{c['comp']:X} data 0x{c['data']:X} hangar='{c['hangar']}' "
-                        f"store {self._store_desc(c)}")
-            if c["items"] > 0:
+            groups[c["data"]] = groups.get(c["data"], 0) + 1
+        logger.info("peek: freighter components by data pointer (one entity definition each): " + ", ".join(
+            f"0x{d:X} x{n}" for d, n in sorted(groups.items(), key=lambda kv: kv[1])))
+        freighters.sort(key=lambda c: (groups[c["data"]], -c["node"]))  # rarest definition (capital?) first
+        for c in freighters:
+            logger.info(f"peek: freighter comp 0x{c['comp']:X} data 0x{c['data']:X} store {self._store_desc(c)} "
+                        f"hangar='{c['hangar']}' res={c['res_handle']} data[0:0x20]={c['hangar_raw']} "
+                        f"mStore[0x88:0x98]={c['store_raw']}")
+            if COMPONENT_NODE_HANDLE_OFFSET and c["node"] == 0:
+                logger.info(f"peek: comp 0x{c['comp']:X} has node handle 0 (not a live ship); skipped")
+                continue
+            if c["items"] > 0 or c["w"] * c["h"] > 1:
                 # A store with items has been generated (the getter is idempotent: repeated visor scans of the
                 # same ship never regenerated). Dimensions are not a valid test: the constructed, not yet
                 # generated store already reads 1x1 with a non-C class value.
@@ -1084,11 +1121,12 @@ class FreighterClassPeek(Mod):
             logger.error(f"peek: cannot read store 0x{store_addr:X}: {e}")
             return
         after = self._classify_component(comp) or {}
-        cap = " CAPITAL" if after.get("hangar") else ""
-        line = (f"{time.strftime('%H:%M:%S')}  freighter{cap} comp 0x{comp:X}: class {klass} {w}x{h} "
-                f"items={after.get('items', '?')} (generated by peek)")
-        if not after.get("items"):
-            logger.warning("peek: the getter returned but the store still holds no items; the call did not generate "
+        node = f" node={after['node']}" if after.get("node", -1) >= 0 else ""
+        seed = f" seed={self._last_seed_bytes[:8].hex()}" if self._last_seed_bytes else ""
+        line = (f"{time.strftime('%H:%M:%S')}  freighter comp 0x{comp:X} data 0x{after.get('data', 0):X}: "
+                f"class {klass} {w}x{h}{node}{seed} (generated by peek)")
+        if w * h <= 1:
+            logger.warning("peek: the getter returned but the store is still 1x1; the call did not generate "
                            "(wrong getter, wrong arguments, or this component is not a live ship)")
         self._peek_lines.append(line)
         self.state.peek_result = line
