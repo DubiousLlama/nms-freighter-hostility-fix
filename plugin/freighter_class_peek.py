@@ -136,6 +136,15 @@ COMPONENT_SNAPSHOT_SIZE = 0x8A60  # observed pool stride between components; byt
 # skips components whose handle is 0 (pool slots that are not live ships) and prints the handle per ship.
 COMPONENT_NODE_HANDLE_OFFSET = 0
 
+# Step 6: the class the game SELLS you is not the class in the AI component's trade store (peek said B for
+# the ship that landed as C). The sale class is rolled on the landing path, in 4.13 terms
+# cGcPurchaseableItem::SetupFreighter(this, uint32, uint32, bool, TkResHandle). Turn on "Trace new stores"
+# in the GUI, land on the capital, and the log prints the call chain for every store generated at
+# landing; resolve the outer frames with the finder and put the setup function's start here to log its
+# arguments (the seed it rolls from) on the next landing.
+PURCHASE_SETUP_FUNCTION_OFFSET = 0
+TRACE_CHAIN_BUDGET = 16  # chains logged per activation of the trace toggle
+
 # Register arguments seen on the getter during a natural scan: getter(this=component, a1, a2, a3). The mod
 # records the live values the first time a visor scan runs in a session and replays those. Before that it
 # falls back to these, which are last session's raw registers (a2 looked like a pointer into NMS.exe, so it
@@ -218,6 +227,7 @@ class InventoryEvent:
 class PeekState(ModState):
     announce_in_game: bool = False
     calibration_logging: bool = True
+    trace_new_stores: bool = False
     min_slots: int = MIN_SLOTS_FOR_FREIGHTER
     last_freighter: str = "none seen yet"
     caller_to_resolve: str = ""
@@ -265,6 +275,7 @@ class FreighterClassPeek(Mod):
         self._component_region: Optional[tuple[int, int]] = None  # (base, size) of the region holding components
         self._component_snapshot: Optional[tuple[int, Optional[bytes]]] = None  # (component, bytes before the getter)
         self._last_seed_bytes: bytes = b""  # seed passed to the store generator on its last call
+        self._trace_budget = 0
 
     # ---------------------------------------------------------------- GUI
 
@@ -303,6 +314,18 @@ class FreighterClassPeek(Mod):
     @calibration_logging.setter
     def calibration_logging(self, value: bool):
         self.state.calibration_logging = value
+
+    @property
+    @BOOLEAN("Trace new stores (log call chain of each newly filled store; turn on, then land)")
+    def trace_new_stores(self) -> bool:
+        return self.state.trace_new_stores
+
+    @trace_new_stores.setter
+    def trace_new_stores(self, value: bool):
+        self.state.trace_new_stores = value
+        if value:
+            self._trace_budget = TRACE_CHAIN_BUDGET
+            logger.info(f"trace armed for the next {TRACE_CHAIN_BUDGET} new stores")
 
     @property
     @BOOLEAN("Announce in-game (needs ENABLE_HUD_ANNOUNCE=True in file)")
@@ -469,6 +492,16 @@ class FreighterClassPeek(Mod):
             self._pending[addr] = (time.time(), caller, self._in_generate)
             if self._in_visor_scan:
                 self._pending_scan_t = time.time()
+            if self.state.trace_new_stores and self._trace_budget > 0 and caller and addr not in self._known_stores:
+                self._trace_budget -= 1
+                try:
+                    chain = self._stack_return_addresses(caller, max_frames=14)
+                    logger.info(f"TRACE store 0x{addr:X} first Add() chain, innermost first: "
+                                + ", ".join(f"NMS+0x{a:X}" for a in chain))
+                except Exception as e:
+                    logger.error(f"trace failed: {e}")
+                if self._trace_budget == 0:
+                    logger.info("trace budget spent; toggle 'Trace new stores' off and on to re-arm")
         else:
             t0, c0, g0 = self._pending[addr]
             self._pending[addr] = (time.time(), c0, g0 or self._in_generate)
@@ -672,6 +705,58 @@ class FreighterClassPeek(Mod):
             logger.info(f"getter returned 0x{r:X}{note}")
             if self._in_visor_scan:
                 self._log_component_changes(int(this))
+
+    if PURCHASE_SETUP_FUNCTION_OFFSET:
+
+        @get_caller
+        @manual_hook(
+            "PurchaseableItemSetupFreighter",
+            offset=PURCHASE_SETUP_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),
+            detour_time="before",
+        )
+        def _purchase_setup_before(self, this, a1, a2, a3, *_stack):
+            try:
+                caller = self._purchase_setup_before.caller_address()
+            except Exception:
+                caller = 0
+            extra = ""
+            for name, v in (("a1", a1), ("a2", a2), ("a3", a3)):
+                try:
+                    if 0x10000 < int(v) < 0x7FFFFFFFFFFF:
+                        extra += f" {name} bytes=" + ctypes.string_at(int(v), 16).hex(" ").upper()
+                except Exception:
+                    pass
+            logger.info(
+                f"purchase setup(this=0x{int(this):X}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}, "
+                f"stack={[hex(int(x)) for x in _stack[:4]]}) called from NMS+0x{caller:X}{extra}"
+            )
+            if self._last_scan_node:
+                for name, v in (("a1", a1), ("a2", a2), ("a3", a3)):
+                    d = (int(v) & 0xFFFFFFFF) - self._last_scan_node
+                    if -2 <= d <= 2:
+                        logger.info(f"purchase setup: {name} is the last scanned node handle {d:+d}")
+
+        @manual_hook(
+            "PurchaseableItemSetupFreighter",
+            offset=PURCHASE_SETUP_FUNCTION_OFFSET,
+            func_def=FUNCDEF(restype=c_uint64, argtypes=[c_uint64] * 8),
+            detour_time="after",
+        )
+        def _purchase_setup_after(self, this, a1, a2, a3, *_stack, _result_=None):
+            # Look for cGcInventoryStore objects inside the purchasable item: a class value 0..3 at +0x100
+            # of a 16-aligned block whose width/height at +0x80 are plausible.
+            import struct as _struct
+            blk = self._read(int(this), 0x1000)
+            if blk is None:
+                return
+            found = []
+            for off in range(0, 0x1000 - 0x104, 8):
+                w, h = _struct.unpack_from("<hh", blk, off + 0x80)
+                (k,) = _struct.unpack_from("<I", blk, off + 0x100)
+                if 1 <= w <= 16 and 1 <= h <= 16 and k <= 3:
+                    found.append(f"+0x{off:X}: class {cGcInventoryClass(k).name} {w}x{h}")
+            logger.info("purchase setup done; store-like blocks in the item: " + ("; ".join(found) or "none"))
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
 
@@ -1035,9 +1120,9 @@ class FreighterClassPeek(Mod):
         groups: dict[int, int] = {}
         for c in freighters:
             groups[c["data"]] = groups.get(c["data"], 0) + 1
-        logger.info("peek: freighter components by data pointer (one entity definition each): " + ", ".join(
-            f"0x{d:X} x{n}" for d, n in sorted(groups.items(), key=lambda kv: kv[1])))
-        freighters.sort(key=lambda c: (groups[c["data"]], -c["node"]))  # rarest definition (capital?) first
+        logger.info(f"peek: {len(freighters)} freighter components, {len(groups)} distinct data pointers "
+                    f"(observed: one per instance, so the pointer does not identify the capital)")
+        freighters.sort(key=lambda c: (0 if (c["hangar"] or c["res_handle"] not in (0, -1)) else 1, -c["node"]))
         for c in freighters:
             logger.info(f"peek: freighter comp 0x{c['comp']:X} data 0x{c['data']:X} store {self._store_desc(c)} "
                         f"hangar='{c['hangar']}' res={c['res_handle']} data[0:0x20]={c['hangar_raw']} "
@@ -1124,7 +1209,7 @@ class FreighterClassPeek(Mod):
         node = f" node={after['node']}" if after.get("node", -1) >= 0 else ""
         seed = f" seed={self._last_seed_bytes[:8].hex()}" if self._last_seed_bytes else ""
         line = (f"{time.strftime('%H:%M:%S')}  freighter comp 0x{comp:X} data 0x{after.get('data', 0):X}: "
-                f"class {klass} {w}x{h}{node}{seed} (generated by peek)")
+                f"trade-store class {klass} {w}x{h}{node}{seed} (generated by peek; NOT the sale class, see README)")
         if w * h <= 1:
             logger.warning("peek: the getter returned but the store is still 1x1; the call did not generate "
                            "(wrong getter, wrong arguments, or this component is not a live ship)")

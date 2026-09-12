@@ -76,9 +76,14 @@ The game rolls an NPC freighter's class lazily, on the first analysis-visor scan
    test, not the grid size. A fleet has several Freighter-type components (capital plus
    escorts-of-type-freighter); the capital is tagged `CAPITAL(hangar)`.
 
-Because the peek runs the game's own generation code, the class it shows is the one you would
-get by scanning or landing, and it stays fixed until you reload. Reloading re-rolls it (the seed
-is the per-session node handle), so a peek-reload loop is the fastest way to hunt an S-class.
+**Status (2026-09-11): the class the peek shows is the AI ship's trade-store class, and it is
+not the class the game sells you.** Test: the peek generated class B for the component whose
+seed matched the visor-scanned capital (node handle + 1), and landing on it offered class C.
+The sale class is rolled on the landing path (4.13 name `cGcPurchaseableItem::SetupFreighter`),
+from a seed the plugin has not yet identified. To find it: turn on **Trace new stores**, land
+on the capital, and paste the `TRACE store ... chain` lines; resolve the outer frames with the
+finder and put the setup function's start into `PURCHASE_SETUP_FUNCTION_OFFSET`, which logs its
+arguments and the store-like blocks inside the purchasable item on the next landing.
 
 Configuration in the file header (`GETTER_FUNCTION_OFFSET`, `COMPONENT_VTABLE_OFFSET`,
 `COMPONENT_STORE_OFFSET`, `COMPONENT_DATA_PTR_OFFSET`) is set for the build the research was done

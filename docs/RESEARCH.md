@@ -210,10 +210,24 @@ visor scan.
   SwarmDrone; the observed freighter had `CombatDefinitionID` empty); general
   `cGcInventoryStore` embedded at +0x7D40; technology store at +0x7F88. Component addresses
   were identical across sessions, so the components live in a stable pool.
-* Peek-from-space design that follows: scan the heap for objects whose first qword is the
-  component vtable, keep those whose data pointer says Type = Freighter, and call the getter on
-  each one whose store still has zero width and height. That is the same code path a visor scan
-  takes, so the class it yields is the class a scan would yield, and the game keeps it.
+* Peek-from-space as built: scan the heap for objects whose first qword is the component
+  vtable, keep those whose data pointer says Type = Freighter, and call the getter on each one
+  whose store has not been generated (the constructed store reads 1x1, class value 1, no
+  items; the item count lives at store+0x8C, TkStd::tk_vector size). One system produced 61
+  Freighter-type components: 7 with a hangar model (`HANGARINTERIORPARTS/HANGAR.SCENE.MBIN`,
+  capital plus fleet freighters) and 54 without (frigates, presumably). Every component has
+  its own `cGcAISpaceshipComponentData` pointer, so the pointer does not identify the entity
+  definition.
+* **The trade-store class is not the sale class.** The peek rolled class B for the component
+  whose generation seed (0x5BE61A) was the visor target's node handle (6022681) plus one, and
+  the getter returned that same cached store during the scan; landing on that freighter
+  offered class C. Only the 7 hangar components went through the hooked store generator
+  (`NMS+0x4CBC80`, class passed in as arg+1, items added); the 54 others got dimensions and a
+  class by another path and no items. Landing generated a burst of four stores (6x3, 8x3,
+  8x3, 10x6, caller `NMS+0x57D923`) and three more (one on the stack, caller
+  `NMS+0x4CD14D`); the sale class comes from that path, in 4.13 terms
+  `cGcPurchaseableItem::SetupFreighter(this, uint32, uint32, bool, TkResHandle)` and
+  `cGcPurchaseableItem::GetItemInventory`. Identifying its seed is the open step.
 
 ## Unknowns to settle in-game (test plan)
 
