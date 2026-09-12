@@ -180,8 +180,40 @@ Design consequence: the class is a field of the NPC ship's `cGcInventoryStore`, 
 `GenerateProceduralClass` inside `GenerateInventory`, and items are inserted through `Add`. The
 plugin hooks `Add` (known pattern) and reads `mClass` after the store settles; the two generation
 functions are optional refinements whose current-build patterns must be extracted by the user.
-Open question the plugin's log will answer: whether `GenerateInventory` runs at freighter spawn
-(peek is useful) or at hangar entry (nothing can show it earlier).
+Open question the plugin's log answered (below): `GenerateInventory` runs at neither spawn nor
+hangar entry; it runs lazily on first use, and the first use in normal play is the analysis
+visor scan.
+
+### Live findings on the current build (from the plugin's hooks, September 2026)
+
+* An NPC freighter's inventory and class are not generated at warp-in, at hangar entry, or when
+  the captain is spoken to. They are generated the first time the analysis visor scans the ship
+  (`cGcBinoculars::PopulateDiscoveryInfo`) and cached in the component afterwards; repeated scans
+  of the same node do not regenerate. Verified over six reloads.
+* The seed handed to the store generator is the freighter's scene-node handle plus one. Node
+  handles are assigned per session, so the class re-rolls after every reload (observed A, C, B,
+  A, B, B for the same freighter across reloads). Save-scumming therefore works, and the roll is
+  decided at scan time, not at spawn time.
+* Call chain during a scan, innermost first: store generator `NMS+0x4CBC80`
+  (`this` = the store, args `(cTkSeed*, class+1, 1)`; C, B, A observed as 1, 2, 3) <-
+  `NMS+0x4CA440` (a store-level wrapper; hooking it crashes, it takes stack arguments) <-
+  `NMS+0x4DD3A4` <- `NMS+0x4CA796` <- component generator (return address `NMS+0x1703C6C`,
+  `this` = the `cGcAISpaceshipComponent`) <- lazy getter (return address `NMS+0x1703900`) <-
+  visor code `NMS+0xE7AC30` / `NMS+0x53D5FB`.
+* The getter is called as `getter(this=component, a1=0x670F00, a2=<pointer into NMS.exe>,
+  a3=0xF367)` and returns the component's general store. It matches the 4.13 signature
+  `cGcAISpaceshipComponent::GetInventoryStore(this, ?, int)`; the extra registers are replayed
+  verbatim by the peek since their meaning is unconfirmed.
+* `cGcAISpaceshipComponent` layout on this build: vtable at +0 = `NMS+0x4AE0EB8`; pointer to
+  `cGcAISpaceshipComponentData` at +0x28 (that struct has `Class` at +0x34, `Type` at +0x38 with
+  `GcAISpaceshipTypes` = None, Pirate, Police, Trader, Freighter(4), PlayerSquadron, DefenceForce,
+  SwarmDrone; the observed freighter had `CombatDefinitionID` empty); general
+  `cGcInventoryStore` embedded at +0x7D40; technology store at +0x7F88. Component addresses
+  were identical across sessions, so the components live in a stable pool.
+* Peek-from-space design that follows: scan the heap for objects whose first qword is the
+  component vtable, keep those whose data pointer says Type = Freighter, and call the getter on
+  each one whose store still has zero width and height. That is the same code path a visor scan
+  takes, so the class it yields is the class a scan would yield, and the game keeps it.
 
 ## Unknowns to settle in-game (test plan)
 

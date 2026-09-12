@@ -45,7 +45,7 @@ import ctypes
 import logging
 import time
 from collections import deque
-from ctypes import _Pointer, c_bool, c_float, c_int, c_uint32, c_uint64
+from ctypes import _Pointer, c_bool, c_int, c_uint64
 from dataclasses import dataclass
 from typing import Annotated, Optional
 
@@ -120,6 +120,31 @@ ENABLE_HUD_ANNOUNCE = False
 # Delay before a newly touched store is inspected, so the generator has finished writing it.
 SETTLE_SECONDS = 0.25
 
+# Step 5, peek from space. These are the facts recorded from a natural visor scan on the current build
+# (see docs/RESEARCH.md). The peek scans process memory for cGcAISpaceshipComponent instances (objects
+# whose first qword is the component vtable), keeps the ones whose data says Type = Freighter, and calls the
+# component's lazy inventory getter on each one whose store is still empty. That is exactly what a visor
+# scan does, so the class it produces is the class you would get by scanning, and the game caches it.
+COMPONENT_VTABLE_OFFSET = 0x4AE0EB8  # NMS+X of the vtable; 0 = use the value captured from a natural scan
+COMPONENT_DATA_PTR_OFFSET = 0x28  # component+0x28 -> cGcAISpaceshipComponentData (Class +0x34, Type +0x38)
+COMPONENT_STORE_OFFSET = 0x7D40  # general cGcInventoryStore embedded in the component (the getter returns it)
+COMPONENT_TECH_STORE_OFFSET = 0x7F88  # technology store, for reference only
+AI_SHIP_TYPE_FREIGHTER = 4  # GcAISpaceshipTypes: None, Pirate, Police, Trader, Freighter, PlayerSquadron, ...
+
+# Register arguments seen on the getter during a natural scan: getter(this=component, a1, a2, a3). The mod
+# records the live values the first time a visor scan runs in a session and replays those. Before that it
+# falls back to these, which are last session's raw registers (a2 looked like a pointer into NMS.exe, so it
+# may be stale after a relaunch); if the fallback crashes, scan one freighter first and peek after that.
+GETTER_DEFAULT_ARGS = (0x670F00, 0x7FF76E042BB0, 0xF367)
+PEEK_ALLOW_DEFAULT_GETTER_ARGS = True
+
+# Memory-scan limits. Only committed, private, read-write regions are scanned; single regions larger than
+# this are skipped (the component pool is far smaller). A full scan of a multi-GB process takes seconds and
+# runs on a background thread; once a hit is found, later peeks scan only that region.
+PEEK_SCAN_MAX_REGION_MB = 2048
+PEEK_MIN_REGION_KB = 64
+PEEK_KEY = "p"
+
 # ============================================================================================
 # Optional Layer 2 hook definitions (only created when patterns are supplied)
 # ============================================================================================
@@ -153,6 +178,13 @@ if SIG_GENERATE_PROCEDURAL_CLASS:
 # ============================================================================================
 
 
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
+                ("AllocationProtect", ctypes.c_uint32), ("PartitionId", ctypes.c_uint16),
+                ("RegionSize", ctypes.c_uint64), ("State", ctypes.c_uint32),
+                ("Protect", ctypes.c_uint32), ("Type", ctypes.c_uint32)]
+
+
 @dataclass
 class InventoryEvent:
     when: float
@@ -184,6 +216,7 @@ class PeekState(ModState):
     min_slots: int = MIN_SLOTS_FOR_FREIGHTER
     last_freighter: str = "none seen yet"
     caller_to_resolve: str = ""
+    peek_result: str = "(no peek yet)"
 
 
 # ============================================================================================
@@ -218,6 +251,13 @@ class FreighterClassPeek(Mod):
         self._freighter_component = 0
         self._component_vtable = 0
         self._store_offset_in_component = 0
+        # Peek-from-space state
+        self._getter_args: Optional[tuple[int, int, int]] = None  # captured from a natural visor scan
+        self._getter_addr_auto = 0  # function start resolved from the AI generator's caller, if hooked
+        self._peek_queue: deque[int] = deque()  # component addresses waiting for a getter call (game thread)
+        self._peek_lines: deque[str] = deque(maxlen=12)
+        self._peek_running = False
+        self._component_region: Optional[tuple[int, int]] = None  # (base, size) of the region holding components
 
     # ---------------------------------------------------------------- GUI
 
@@ -316,6 +356,27 @@ class FreighterClassPeek(Mod):
         self.reannounce()
 
     @property
+    @STRING("Peek results (freighter classes)", readonly=True, multiline=True, height=160)
+    def peek_result(self) -> str:
+        return "\n".join(reversed(self._peek_lines)) or self.state.peek_result
+
+    @peek_result.setter
+    def peek_result(self, value: str):
+        pass
+
+    @gui_button("Peek freighter classes from space (memory scan + generate)")
+    def peek_freighters(self):
+        self._start_peek(full=False)
+
+    @gui_button("Peek: full memory rescan")
+    def peek_freighters_full(self):
+        self._start_peek(full=True)
+
+    @on_key_pressed(PEEK_KEY)
+    def key_peek(self):
+        self._start_peek(full=False)
+
+    @property
     @STRING("Caller address to resolve (paste 0x... from a log line)")
     def caller_to_resolve(self) -> str:
         return self.state.caller_to_resolve
@@ -346,16 +407,28 @@ class FreighterClassPeek(Mod):
                 "'has a modified hook to get the calling address'."
             )
             return
+        candidates = self._function_start_candidates(rel)
+        if not candidates:
+            logger.error("No 0xCC padding found within 128 KB below that address; use a disassembler.")
+            return
+        for c in candidates:
+            head = ctypes.string_at(BASE_ADDRESS + c, 12).hex(" ").upper()
+            logger.info(f"function start candidate: NMS+0x{c:X}  (0x{rel - c:X} bytes before the caller)  bytes: {head}")
+        logger.info(f"Put the nearest candidate into GENERATOR_FUNCTION_OFFSET (e.g. 0x{candidates[0]:X}) and reload.")
+
+    @staticmethod
+    def _function_start_candidates(rel: int, limit: int = 3) -> list[int]:
+        """Nearest 16-aligned bytes following a run of 0xCC padding below NMS+rel, nearest first."""
         try:
             span = 0x20000
             start = max(0, rel - span)
             buf = ctypes.string_at(BASE_ADDRESS + start, rel - start)
         except Exception as e:
             logger.error(f"Cannot read memory below NMS+0x{rel:X}: {e}")
-            return
-        candidates = []
+            return []
+        candidates: list[int] = []
         i = len(buf) - 1
-        while i > 2 and len(candidates) < 3:
+        while i > 2 and len(candidates) < limit:
             if buf[i] == 0xCC and buf[i - 1] == 0xCC:
                 j = i + 1  # first non-padding byte after the run
                 while j < len(buf) and buf[j] == 0xCC:
@@ -366,13 +439,7 @@ class FreighterClassPeek(Mod):
                 i -= 2
             else:
                 i -= 1
-        if not candidates:
-            logger.error("No 0xCC padding found within 128 KB below that address; use a disassembler.")
-            return
-        for c in candidates:
-            head = ctypes.string_at(BASE_ADDRESS + c, 12).hex(" ").upper()
-            logger.info(f"function start candidate: NMS+0x{c:X}  (0x{rel - c:X} bytes before the caller)  bytes: {head}")
-        logger.info(f"Put the nearest candidate into GENERATOR_FUNCTION_OFFSET (e.g. 0x{candidates[0]:X}) and reload.")
+        return candidates
 
     # ---------------------------------------------------------------- Hooks: Layer 1
 
@@ -510,12 +577,19 @@ class FreighterClassPeek(Mod):
                     extra = " a1 bytes=" + ctypes.string_at(int(a1), 16).hex(" ").upper()
             except Exception:
                 pass
+            caller = 0
             try:
                 caller = self._ai_generator_before.caller_address()
                 extra += f" called from NMS+0x{caller:X}"
             except Exception:
                 pass
             t = int(this)
+            if caller and self._in_visor_scan and not GETTER_FUNCTION_OFFSET and not self._getter_addr_auto:
+                cands = self._function_start_candidates(caller)
+                if cands:
+                    self._getter_addr_auto = cands[0]
+                    logger.info(f"getter function start resolved automatically: NMS+0x{cands[0]:X} "
+                                "(the peek will call this; set GETTER_FUNCTION_OFFSET to pin it)")
             if self._is_player_store(t):
                 kind = "= PLAYER-STATE store (not the freighter path; ignore unless visor_scan=True)"
             elif t in self._known_stores or t in self._pending:
@@ -543,6 +617,9 @@ class FreighterClassPeek(Mod):
                 f"getter(this=0x{int(this):X}, a1=0x{int(a1):X}, a2=0x{int(a2):X}, a3=0x{int(a3):X}) "
                 f"visor_scan={self._in_visor_scan}"
             )
+            if self._in_visor_scan and self._getter_args is None:
+                self._getter_args = (int(a1), int(a2), int(a3))
+                logger.info("getter arguments captured from the natural scan; the peek will replay them")
 
         @manual_hook(
             "AIShipComponentGetInventory",
@@ -558,6 +635,10 @@ class FreighterClassPeek(Mod):
             note = ""
             if r and (r in self._known_stores or r in self._pending or abs(r - int(this)) < 0x20000):
                 note = " (looks like a store pointer inside the component)"
+                if self._in_visor_scan:
+                    self._freighter_component = int(this)
+                    if not self._component_vtable:
+                        self._analyse_component(int(this))
             logger.info(f"getter returned 0x{r:X}{note}")
 
     # ---------------------------------------------------------------- Hooks: Layer 2 (optional)
@@ -597,6 +678,8 @@ class FreighterClassPeek(Mod):
 
     @main_loop.after
     def _process_pending(self):
+        if self._peek_queue:
+            self._run_peek_queue()
         if self._burst and time.time() - self._burst_t > 1.0:
             self._flush_burst()
         if not self._pending:
@@ -717,6 +800,229 @@ class FreighterClassPeek(Mod):
             logger.info("no cGcAISpaceshipComponentData pointer found in the first 0x400 bytes with Type=4/Class=0; "
                         "will try a wider window next time")
 
+    # ---------------------------------------------------------------- Peek from space
+
+    def _start_peek(self, full: bool):
+        """Entry point for the button and the key. Runs the memory scan on a background thread (the GUI
+        and keyboard threads must not block, and the scan must not touch the game thread); getter calls
+        are queued for the game thread and executed one per frame by _process_pending."""
+        if self._peek_running:
+            logger.info("peek already running")
+            return
+        if not (GETTER_FUNCTION_OFFSET or self._getter_addr_auto):
+            logger.error("No getter address: set GETTER_FUNCTION_OFFSET (or hook the AI generator and scan one "
+                         "freighter so it resolves automatically)")
+            return
+        if self._getter_args is None and not PEEK_ALLOW_DEFAULT_GETTER_ARGS:
+            logger.error("Getter arguments not captured yet: visor-scan one freighter first, then peek")
+            return
+        import threading
+        self._peek_running = True
+        threading.Thread(target=self._peek_scan, args=(full,), name="FreighterPeekScan", daemon=True).start()
+
+    # -- raw memory helpers (ReadProcessMemory on our own process: a bad address fails instead of faulting)
+
+    def _k32(self):
+        k32 = ctypes.windll.kernel32
+        k32.VirtualQuery.restype = ctypes.c_size_t
+        k32.VirtualQuery.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
+        k32.ReadProcessMemory.restype = ctypes.c_int
+        k32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t,
+                                          ctypes.POINTER(ctypes.c_size_t)]
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        return k32
+
+    def _read(self, addr: int, size: int) -> Optional[bytes]:
+        if addr < 0x10000 or addr > 0x7FFFFFFFFFFF:
+            return None
+        k32 = self._k32()
+        buf = ctypes.create_string_buffer(size)
+        got = ctypes.c_size_t(0)
+        if not k32.ReadProcessMemory(k32.GetCurrentProcess(), addr, buf, size, ctypes.byref(got)) or got.value != size:
+            return None
+        return buf.raw
+
+    def _query_region(self, addr: int) -> Optional[tuple[int, int, int, int, int]]:
+        mbi = MEMORY_BASIC_INFORMATION()
+        if not self._k32().VirtualQuery(addr, ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            return None
+        return mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type
+
+    def _scannable_regions(self) -> list[tuple[int, int]]:
+        """Committed, private, plain read-write regions (the heap), excluding NMS.exe itself."""
+        out = []
+        addr = 0x10000
+        img_lo, img_hi = BASE_ADDRESS, BASE_ADDRESS + SIZE_OF_IMAGE
+        while addr < 0x7FFFFFFF0000:
+            q = self._query_region(addr)
+            if q is None:
+                break
+            base, size, state, protect, typ = q
+            if (state == 0x1000 and typ == 0x20000 and protect == 0x04  # MEM_COMMIT, MEM_PRIVATE, PAGE_READWRITE
+                    and PEEK_MIN_REGION_KB * 1024 <= size <= PEEK_SCAN_MAX_REGION_MB * 1024 * 1024
+                    and not (base < img_hi and base + size > img_lo)):
+                out.append((base, size))
+            addr = base + size
+        return out
+
+    def _scan_region(self, base: int, size: int, needle: bytes) -> list[int]:
+        k32 = self._k32()
+        proc = k32.GetCurrentProcess()
+        chunk = 8 << 20
+        overlap = len(needle) - 1
+        buf = ctypes.create_string_buffer(chunk + overlap)
+        got = ctypes.c_size_t(0)
+        hits: list[int] = []
+        seen: set[int] = set()
+        off = 0
+        while off < size:
+            n = min(chunk + overlap, size - off)
+            if not k32.ReadProcessMemory(proc, base + off, buf, n, ctypes.byref(got)) or not got.value:
+                off += chunk
+                continue
+            data = buf.raw[: got.value]
+            i = data.find(needle)
+            while i != -1:
+                a = base + off + i
+                if a % 8 == 0 and a not in seen:
+                    seen.add(a)
+                    hits.append(a)
+                i = data.find(needle, i + 1)
+            off += chunk
+        return hits
+
+    def _classify_component(self, comp: int) -> Optional[dict]:
+        """Read the fields the peek relies on. Returns None if the object does not look like a component."""
+        import struct as _struct
+        head = self._read(comp, COMPONENT_DATA_PTR_OFFSET + 8)
+        if head is None:
+            return None
+        (data_ptr,) = _struct.unpack_from("<Q", head, COMPONENT_DATA_PTR_OFFSET)
+        blk = self._read(data_ptr, 0x40)
+        if blk is None:
+            return None
+        cls, typ = _struct.unpack_from("<II", blk, 0x34)
+        if typ > 16 or cls > 16:
+            return None
+        store = comp + COMPONENT_STORE_OFFSET
+        sblk = self._read(store, 0x104)
+        if sblk is None:
+            return None
+        w, h = _struct.unpack_from("<hh", sblk, 0x80)
+        (klass,) = _struct.unpack_from("<I", sblk, 0x100)
+        return {"comp": comp, "data": data_ptr, "type": typ, "class_data": cls, "w": w, "h": h, "klass": klass}
+
+    def _peek_scan(self, full: bool):
+        try:
+            self._peek_scan_inner(full)
+        except Exception as e:
+            logger.error(f"peek scan failed: {e!r}")
+        finally:
+            self._peek_running = False
+
+    def _peek_scan_inner(self, full: bool):
+        vt_abs = (BASE_ADDRESS + COMPONENT_VTABLE_OFFSET) if COMPONENT_VTABLE_OFFSET else self._component_vtable
+        if not vt_abs:
+            logger.error("component vtable unknown: set COMPONENT_VTABLE_OFFSET or visor-scan one freighter first")
+            return
+        needle = vt_abs.to_bytes(8, "little")
+
+        regions: list[tuple[int, int]] = []
+        if not full:
+            seeds = [a for a in (self._freighter_component,) if a]
+            if self._component_region:
+                seeds.insert(0, self._component_region[0])
+            for a in seeds:
+                q = self._query_region(a)
+                if q and q[2] == 0x1000:
+                    regions.append((q[0], q[1]))
+                    break
+        scope = "known region" if regions else "full heap"
+        if not regions:
+            regions = self._scannable_regions()
+        total = sum(sz for _, sz in regions)
+        logger.info(f"peek: scanning {len(regions)} region(s), {total / (1 << 20):.0f} MB ({scope}) for vtable "
+                    f"NMS+0x{vt_abs - BASE_ADDRESS:X} ...")
+        t0 = time.time()
+        hits: list[int] = []
+        for base, size in regions:
+            hits.extend(self._scan_region(base, size, needle))
+        logger.info(f"peek: {len(hits)} vtable hit(s) in {time.time() - t0:.1f} s")
+        if not hits and not full and scope == "known region":
+            logger.info("peek: nothing in the known region, falling back to a full scan")
+            self._component_region = None
+            self._peek_scan_inner(True)
+            return
+
+        comps = [c for c in (self._classify_component(h) for h in hits) if c]
+        by_type: dict[int, int] = {}
+        for c in comps:
+            by_type[c["type"]] = by_type.get(c["type"], 0) + 1
+        type_names = {0: "None", 1: "Pirate", 2: "Police", 3: "Trader", 4: "Freighter", 5: "PlayerSquadron",
+                      6: "DefenceForce", 7: "SwarmDrone"}
+        logger.info("peek: components by type: " + ", ".join(
+            f"{type_names.get(t, t)}={n}" for t, n in sorted(by_type.items())) if comps else "peek: no components")
+        if comps and not self._component_region:
+            q = self._query_region(comps[0]["comp"])
+            if q:
+                self._component_region = (q[0], q[1])
+                logger.info(f"peek: component region 0x{q[0]:X} ({q[1] >> 10} KB) remembered for later peeks")
+
+        freighters = [c for c in comps if c["type"] == AI_SHIP_TYPE_FREIGHTER]
+        if not freighters:
+            self._peek_lines.append(f"{time.strftime('%H:%M:%S')}  no freighter components in memory")
+            return
+        queued = 0
+        for c in freighters:
+            if c["w"] > 0 and c["h"] > 0:
+                line = (f"{time.strftime('%H:%M:%S')}  freighter comp 0x{c['comp']:X}: already generated, "
+                        f"class {cGcInventoryClass(c['klass']).name} {c['w']}x{c['h']}")
+                self._peek_lines.append(line)
+                logger.info(line)
+            else:
+                self._peek_queue.append(c["comp"])
+                queued += 1
+        if queued:
+            logger.info(f"peek: {queued} ungenerated freighter inventor{'y' if queued == 1 else 'ies'} queued; "
+                        "the getter runs on the game thread over the next frames")
+
+    def _run_peek_queue(self):
+        """Game thread only (called from the main-loop hook). One getter call per frame."""
+        comp = self._peek_queue.popleft()
+        off = GETTER_FUNCTION_OFFSET or self._getter_addr_auto
+        args = self._getter_args or (GETTER_DEFAULT_ARGS if PEEK_ALLOW_DEFAULT_GETTER_ARGS else None)
+        if not off or args is None:
+            logger.error("peek: getter address or arguments unavailable; queue cleared")
+            self._peek_queue.clear()
+            return
+        info = self._classify_component(comp)
+        if info is None or info["type"] != AI_SHIP_TYPE_FREIGHTER:
+            logger.info(f"peek: component 0x{comp:X} vanished or changed since the scan; skipped")
+            return
+        src = "captured" if self._getter_args else "default"
+        logger.info(f"peek: calling getter NMS+0x{off:X}(0x{comp:X}, {', '.join(f'0x{a:X}' for a in args)}) [{src} args]")
+        try:
+            fn = ctypes.CFUNCTYPE(c_uint64, c_uint64, c_uint64, c_uint64, c_uint64)(BASE_ADDRESS + off)
+            ret = int(fn(comp, *args))
+        except Exception as e:
+            logger.error(f"peek: getter call failed: {e!r}; queue cleared")
+            self._peek_queue.clear()
+            return
+        store_addr = ret if abs(ret - comp) < 0x20000 else comp + COMPONENT_STORE_OFFSET
+        try:
+            store = map_struct(store_addr, nms.cGcInventoryStore)
+            klass = self._class_name(store)
+            w, h = int(store.miWidth), int(store.miHeight)
+        except Exception as e:
+            logger.error(f"peek: cannot read store 0x{store_addr:X}: {e}")
+            return
+        line = f"{time.strftime('%H:%M:%S')}  freighter comp 0x{comp:X}: class {klass} {w}x{h} (generated by peek)"
+        self._peek_lines.append(line)
+        self.state.peek_result = line
+        self.state.last_freighter = f"class {klass}  ({w}x{h}={w * h} cells, peek)"
+        logger.info("PEEK RESULT: " + line)
+        self._announce(f"Freighter class {klass}")
+
     # ---------------------------------------------------------------- Stack walk
 
     def _stack_return_addresses(self, anchor_rel: int, max_frames: int = 16) -> list[int]:
@@ -730,12 +1036,6 @@ class FreighterClassPeek(Mod):
         k32 = ctypes.windll.kernel32
         lo, hi = ctypes.c_uint64(), ctypes.c_uint64()
         k32.GetCurrentThreadStackLimits(ctypes.byref(lo), ctypes.byref(hi))
-
-        class MBI(ctypes.Structure):
-            _fields_ = [("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
-                        ("AllocationProtect", ctypes.c_uint32), ("PartitionId", ctypes.c_uint16),
-                        ("RegionSize", ctypes.c_uint64), ("State", ctypes.c_uint32),
-                        ("Protect", ctypes.c_uint32), ("Type", ctypes.c_uint32)]
 
         k32.VirtualQuery.restype = ctypes.c_size_t
         k32.VirtualQuery.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
@@ -760,7 +1060,7 @@ class FreighterClassPeek(Mod):
         hits: list[tuple[int, int]] = []  # (stack address, value)
         addr = lo.value
         while addr < hi.value:
-            mbi = MBI()
+            mbi = MEMORY_BASIC_INFORMATION()
             if not k32.VirtualQuery(addr, ctypes.byref(mbi), ctypes.sizeof(mbi)):
                 break
             end = min(mbi.BaseAddress + mbi.RegionSize, hi.value)
